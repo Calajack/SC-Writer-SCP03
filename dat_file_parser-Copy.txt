@@ -1,0 +1,271 @@
+/*
+ * DAT File Parser - Converts CAP files to APDU commands
+ * Based on GlobalPlatform CAP file format
+ */
+#include <algorithm>
+#include <fstream>
+#include <vector>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include "sc_writer_scp03.h"
+
+
+struct AppletInfo {
+    std::string aid;
+    std::vector<unsigned char> aidBytes;
+    std::string name;
+    size_t size;
+};
+
+struct InstallCommand {
+    std::vector<unsigned char> apdu;
+    std::string description;
+    bool isLoad;
+    bool isInstall;
+};
+
+class DatFileParser {
+private:
+    std::vector<unsigned char> hexStringToBytes(const std::string& hex) {
+        std::vector<unsigned char> bytes;
+        for (size_t i = 0; i < hex.length(); i += 2) {
+            std::string byteString = hex.substr(i, 2);
+            unsigned char byte = (unsigned char)strtol(byteString.c_str(), NULL, 16);
+            bytes.push_back(byte);
+        }
+        return bytes;
+    }
+    
+    std::string bytesToHexString(const std::vector<unsigned char>& bytes) {
+        std::stringstream ss;
+        ss << std::hex << std::uppercase;
+        for (unsigned char byte : bytes) {
+            ss << std::setfill('0') << std::setw(2) << (int)byte;
+        }
+        return ss.str();
+    }
+    
+    std::vector<InstallCommand> createLoadCommands(const std::vector<unsigned char>& capData, 
+                                                  const AppletInfo& applet) {
+        std::vector<InstallCommand> commands;
+        
+        // INSTALL [for load] command
+        InstallCommand loadCmd;
+        loadCmd.isLoad = true;
+        loadCmd.isInstall = false;
+        loadCmd.description = "INSTALL [for load] " + applet.name;
+        
+        // Build INSTALL [for load] APDU
+        std::vector<unsigned char> apdu = {0x80, 0xE6, 0x02, 0x00}; // CLA INS P1 P2
+        
+        // Load file data block
+        std::vector<unsigned char> loadBlock;
+        
+        // Package AID length and AID
+        loadBlock.push_back((unsigned char)applet.aidBytes.size());
+        loadBlock.insert(loadBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
+        
+        // Security Domain AID (empty for default)
+        loadBlock.push_back(0x00);
+        
+        // Load file data hash (optional)
+        loadBlock.push_back(0x00);
+        
+        // Load parameters (empty)
+        loadBlock.push_back(0x00);
+        
+        // Load token (empty)
+        loadBlock.push_back(0x00);
+        
+        // Add LC and data
+        apdu.push_back((unsigned char)loadBlock.size());
+        apdu.insert(apdu.end(), loadBlock.begin(), loadBlock.end());
+        
+        // Add LE
+        apdu.push_back(0x00);
+        
+        loadCmd.apdu = apdu;
+        commands.push_back(loadCmd);
+        
+        // LOAD commands - split CAP data into chunks
+        const size_t MAX_CHUNK_SIZE = 200; // Leave room for APDU overhead
+        size_t offset = 0;
+        int sequenceNumber = 0;
+        
+        while (offset < capData.size()) {
+            size_t chunkSize = (MAX_CHUNK_SIZE < (capData.size() - offset)) ? MAX_CHUNK_SIZE : (capData.size() - offset);
+            bool isLast = (offset + chunkSize >= capData.size());
+            
+            InstallCommand chunk;
+            chunk.isLoad = true;
+            chunk.isInstall = false;
+            chunk.description = "LOAD chunk " + std::to_string(sequenceNumber);
+            
+            // Build LOAD APDU
+            std::vector<unsigned char> loadApdu = {
+                0x80, 0xE8, 
+                isLast ? (unsigned char)0x80 : (unsigned char)0x00,  // P1: last block flag
+                (unsigned char)sequenceNumber,  // P2: sequence number
+                (unsigned char)chunkSize       // LC
+            };
+            
+            // Add chunk data
+            loadApdu.insert(loadApdu.end(), 
+                           capData.begin() + offset, 
+                           capData.begin() + offset + chunkSize);
+            
+            chunk.apdu = loadApdu;
+            commands.push_back(chunk);
+            
+            offset += chunkSize;
+            sequenceNumber++;
+        }
+        
+        return commands;
+    }
+    
+    std::vector<InstallCommand> createInstallCommands(const AppletInfo& applet) {
+        std::vector<InstallCommand> commands;
+        
+        InstallCommand installCmd;
+        installCmd.isLoad = false;
+        installCmd.isInstall = true;
+        installCmd.description = "INSTALL [for install] " + applet.name;
+        
+        // Build INSTALL [for install] APDU
+        std::vector<unsigned char> apdu = {0x80, 0xE6, 0x0C, 0x00}; // CLA INS P1 P2
+        
+        std::vector<unsigned char> installBlock;
+        
+        // Package AID
+        installBlock.push_back((unsigned char)applet.aidBytes.size());
+        installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
+        
+        // Module AID (same as package AID for simple applets)
+        installBlock.push_back((unsigned char)applet.aidBytes.size());
+        installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
+        
+        // Instance AID (same as module AID)
+        installBlock.push_back((unsigned char)applet.aidBytes.size());
+        installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
+        
+        // Privileges (default)
+        installBlock.push_back(0x01);
+        installBlock.push_back(0x00);
+        
+        // Install parameters (empty)
+        installBlock.push_back(0x00);
+        
+        // Install token (empty)
+        installBlock.push_back(0x00);
+        
+        // Add LC and data
+        apdu.push_back((unsigned char)installBlock.size());
+        apdu.insert(apdu.end(), installBlock.begin(), installBlock.end());
+        
+        installCmd.apdu = apdu;
+        commands.push_back(installCmd);
+        
+        return commands;
+    }
+
+public:
+    std::vector<InstallCommand> parseDatFile(const std::string& filename) {
+        std::vector<InstallCommand> allCommands;
+        
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open DAT file: " << filename << std::endl;
+            return allCommands;
+        }
+        
+        // Read entire file
+        std::vector<unsigned char> fileData((std::istreambuf_iterator<char>(file)),
+                                           std::istreambuf_iterator<char>());
+        file.close();
+        
+        std::cout << "Parsing DAT file: " << filename << " (" << fileData.size() << " bytes)" << std::endl;
+        
+        // Parse applet information
+        // This is simplified - you may need to adapt based on your exact .dat format
+        AppletInfo applet;
+        applet.name = "TestApplet";
+        applet.aid = "A000000001020304";  // Example AID
+        applet.aidBytes = hexStringToBytes(applet.aid);
+        applet.size = fileData.size();
+        
+        std::cout << "Found applet: " << applet.name << " (AID: " << applet.aid << ")" << std::endl;
+        
+        // Generate LOAD commands
+        auto loadCommands = createLoadCommands(fileData, applet);
+        allCommands.insert(allCommands.end(), loadCommands.begin(), loadCommands.end());
+        
+        // Generate INSTALL commands  
+        auto installCommands = createInstallCommands(applet);
+        allCommands.insert(allCommands.end(), installCommands.begin(), installCommands.end());
+        
+        std::cout << "Generated " << allCommands.size() << " commands from DAT file" << std::endl;
+        
+        return allCommands;
+    }
+    
+    std::vector<InstallCommand> parseCapFolder(const std::string& folderPath) {
+        std::vector<InstallCommand> allCommands;
+        
+        // Parse all CAP files in the folder
+        // This would scan for .cap files and process each one
+        std::cout << "Parsing CAP folder: " << folderPath << std::endl;
+        
+        // Example: Load cap files from cap/ and cap2/ folders
+        std::vector<std::string> capFiles = {
+            folderPath + "/Header.cap",
+            folderPath + "/Directory.cap", 
+            folderPath + "/Applet.cap",
+            folderPath + "/Import.cap",
+            folderPath + "/ConstantPool.cap",
+            folderPath + "/Class.cap",
+            folderPath + "/Method.cap",
+            folderPath + "/StaticField.cap",
+            folderPath + "/RefLocation.cap",
+            folderPath + "/Export.cap",
+            folderPath + "/Descriptor.cap"
+        };
+        
+        for (const auto& capFile : capFiles) {
+            std::ifstream file(capFile, std::ios::binary);
+            if (file.is_open()) {
+                std::vector<unsigned char> capData((std::istreambuf_iterator<char>(file)),
+                                                  std::istreambuf_iterator<char>());
+                file.close();
+                
+                std::cout << "Loaded CAP component: " << capFile << " (" << capData.size() << " bytes)" << std::endl;
+                
+                // Process this CAP component
+                AppletInfo applet;
+                applet.name = "CAP_" + std::to_string(allCommands.size());
+                applet.aid = "A000000001020304";  // You'd extract this from the actual CAP
+                applet.aidBytes = hexStringToBytes(applet.aid);
+                
+                auto commands = createLoadCommands(capData, applet);
+                allCommands.insert(allCommands.end(), commands.begin(), commands.end());
+            }
+        }
+        
+        return allCommands;
+    }
+    
+    void printCommands(const std::vector<InstallCommand>& commands) {
+        std::cout << "\nGenerated Commands:" << std::endl;
+        std::cout << "===================" << std::endl;
+        
+        for (size_t i = 0; i < commands.size(); i++) {
+            const auto& cmd = commands[i];
+            std::cout << (i + 1) << ". " << cmd.description << std::endl;
+            std::cout << "   APDU: " << bytesToHexString(cmd.apdu) << std::endl;
+            std::cout << "   Type: " << (cmd.isLoad ? "LOAD" : "INSTALL") << std::endl;
+            std::cout << std::endl;
+        }
+    }
+};

@@ -1,0 +1,455 @@
+#include <iostream>
+#include <iomanip>
+#include <cstring>
+#include "crypto_engine_scp03.h"
+#include "sc_writer_scp03.h"
+
+SmartCardCryptoSCP03::SmartCardCryptoSCP03() {
+    memset(&state, 0, sizeof(state));
+    state.channelActive = false;
+    state.securityLevel = 0;
+    state.commandCounter = 0;
+
+    std::cout << "SCP03 Crypto Engine initialized (GP 2.2.1) with OpenSSL" << std::endl;
+}
+
+SmartCardCryptoSCP03::~SmartCardCryptoSCP03() {
+    // Nothing to cleanup with OpenSSL
+}
+
+void SmartCardCryptoSCP03::setMasterKeys(const unsigned char* enc, const unsigned char* mac,
+    const unsigned char* dek) {
+    std::cout << "Master keys set for SCP03 derivation" << std::endl;
+}
+
+void SmartCardCryptoSCP03::setHostChallenge(const unsigned char* challenge, size_t length) {
+    if (challenge && length >= 8) {
+        memcpy(state.hostChallenge, challenge, 8);
+        std::cout << "Host Challenge: ";
+        for (int i = 0; i < 8; i++) printf("%02X ", state.hostChallenge[i]);
+        std::cout << std::endl;
+    }
+}
+
+bool SmartCardCryptoSCP03::performAES_ECB_Encrypt(const unsigned char* key,
+    const unsigned char* input,
+    unsigned char* output,
+    size_t dataLen) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        std::cerr << "Failed to create cipher context" << std::endl;
+        return false;
+    }
+
+    if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL)) {
+        std::cerr << "Failed to initialize encryption" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0); // No padding
+
+    int len = 0;
+    if (!EVP_EncryptUpdate(ctx, output, &len, input, (int)dataLen)) {
+        std::cerr << "Failed to encrypt data" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    int finalLen = 0;
+    if (!EVP_EncryptFinal_ex(ctx, output + len, &finalLen)) {
+        std::cerr << "Failed to finalize encryption" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
+}
+
+bool SmartCardCryptoSCP03::performAES_CBC_Encrypt(const unsigned char* key,
+    const unsigned char* iv,
+    const unsigned char* input,
+    unsigned char* output,
+    size_t dataLen) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        std::cerr << "Failed to create cipher context" << std::endl;
+        return false;
+    }
+
+    if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv)) {
+        std::cerr << "Failed to initialize encryption" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0); // No padding
+
+    int len = 0;
+    if (!EVP_EncryptUpdate(ctx, output, &len, input, (int)dataLen)) {
+        std::cerr << "Failed to encrypt data" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    int finalLen = 0;
+    if (!EVP_EncryptFinal_ex(ctx, output + len, &finalLen)) {
+        std::cerr << "Failed to finalize encryption" << std::endl;
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
+}
+
+bool SmartCardCryptoSCP03::performAES_CMAC(const unsigned char* key,
+    const unsigned char* data,
+    size_t dataLen,
+    unsigned char* mac) {
+    CMAC_CTX* ctx = CMAC_CTX_new();
+    if (!ctx) {
+        std::cerr << "Failed to create CMAC context" << std::endl;
+        return false;
+    }
+
+    if (!CMAC_Init(ctx, key, 16, EVP_aes_128_cbc(), NULL)) {
+        std::cerr << "Failed to initialize CMAC" << std::endl;
+        CMAC_CTX_free(ctx);
+        return false;
+    }
+
+    if (!CMAC_Update(ctx, data, dataLen)) {
+        std::cerr << "Failed to update CMAC" << std::endl;
+        CMAC_CTX_free(ctx);
+        return false;
+    }
+
+    size_t macLen = 16;
+    if (!CMAC_Final(ctx, mac, &macLen)) {
+        std::cerr << "Failed to finalize CMAC" << std::endl;
+        CMAC_CTX_free(ctx);
+        return false;
+    }
+
+    CMAC_CTX_free(ctx);
+    return true;
+}
+
+bool SmartCardCryptoSCP03::deriveSessionKey_SCP03(const unsigned char* masterKey,
+    uint8_t keyType,
+    const unsigned char* context,
+    size_t contextLen,
+    unsigned char* derivedKey) {
+    std::vector<unsigned char> derivationData;
+
+    const unsigned char LABEL_ENC[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const unsigned char LABEL_MAC[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 };
+    const unsigned char LABEL_RMAC[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 };
+    const unsigned char LABEL_DEK[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 };
+
+    const unsigned char* label = nullptr;
+    switch (keyType) {
+    case 0x01: label = LABEL_ENC; break;
+    case 0x02: label = LABEL_MAC; break;
+    case 0x03: label = LABEL_RMAC; break;
+    case 0x04: label = LABEL_DEK; break;
+    default: return false;
+    }
+
+    derivationData.insert(derivationData.end(), label, label + 11);
+    derivationData.push_back(0x00);
+    derivationData.push_back(0x00);
+    derivationData.push_back(0x80);
+    derivationData.push_back(0x01);
+
+    if (context && contextLen > 0) {
+        derivationData.insert(derivationData.end(), context, context + contextLen);
+    }
+
+    unsigned char fullMac[16];
+    if (!performAES_CMAC(masterKey, derivationData.data(), derivationData.size(), fullMac)) {
+        return false;
+    }
+
+    memcpy(derivedKey, fullMac, 16);
+    return true;
+}
+
+int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned char>& initUpdateResponse) {
+    if (initUpdateResponse.size() < 32) {
+        std::cerr << "INIT UPDATE response too short for SCP03 (need 32 bytes)" << std::endl;
+        return -1;
+    }
+
+    std::cout << "\n=== SCP03 INITIALIZE SECURE CHANNEL ===" << std::endl;
+
+    memcpy(state.initUpdateResponse, initUpdateResponse.data(), 32);
+
+    memcpy(state.sequenceCounter, &initUpdateResponse[12], 3);
+    memcpy(state.cardChallenge, &initUpdateResponse[13], 8);
+    memcpy(state.cardCryptogram, &initUpdateResponse[21], 8);
+
+    std::cout << "Sequence Counter: ";
+    for (int i = 0; i < 3; i++) printf("%02X ", state.sequenceCounter[i]);
+    std::cout << std::endl;
+
+    std::cout << "Card Challenge: ";
+    for (int i = 0; i < 8; i++) printf("%02X ", state.cardChallenge[i]);
+    std::cout << std::endl;
+
+    std::cout << "Card Cryptogram: ";
+    for (int i = 0; i < 8; i++) printf("%02X ", state.cardCryptogram[i]);
+    std::cout << std::endl;
+
+    unsigned char context[16];
+    memcpy(context, state.hostChallenge, 8);
+    memcpy(context + 8, state.cardChallenge, 8);
+
+    unsigned char masterKey[16] = {
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F
+    };
+
+    std::cout << "\nDeriving session keys..." << std::endl;
+
+    if (!deriveSessionKey_SCP03(masterKey, 0x01, context, 16, state.senc)) {
+        std::cerr << "Failed to derive S-ENC" << std::endl;
+        return -1;
+    }
+    std::cout << "S-ENC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.senc[i]);
+    std::cout << std::endl;
+
+    if (!deriveSessionKey_SCP03(masterKey, 0x02, context, 16, state.smac)) {
+        std::cerr << "Failed to derive S-MAC" << std::endl;
+        return -1;
+    }
+    std::cout << "S-MAC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.smac[i]);
+    std::cout << std::endl;
+
+    if (!deriveSessionKey_SCP03(masterKey, 0x03, context, 16, state.srmac)) {
+        std::cerr << "Failed to derive S-RMAC" << std::endl;
+        return -1;
+    }
+    std::cout << "S-RMAC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.srmac[i]);
+    std::cout << std::endl;
+
+    memset(state.macChaining, 0, 16);
+    memset(state.encCounter, 0, 16);
+
+    std::cout << "? Session keys derived successfully" << std::endl;
+    return 0;
+}
+
+bool SmartCardCryptoSCP03::calculateSCP03Cryptogram(const unsigned char* key,
+    const unsigned char* hostChallenge,
+    const unsigned char* cardChallenge,
+    unsigned char* cryptogram) {
+    unsigned char data[16];
+    memcpy(data, hostChallenge, 8);
+    memcpy(data + 8, cardChallenge, 8);
+
+    unsigned char fullMac[16];
+    if (!performAES_CMAC(key, data, 16, fullMac)) {
+        return false;
+    }
+
+    memcpy(cryptogram, fullMac, 8);
+    return true;
+}
+
+std::vector<unsigned char> SmartCardCryptoSCP03::createExternalAuthenticateCommand(uint8_t securityLevel) {
+    std::vector<unsigned char> apdu;
+
+    if (!state.channelActive && state.senc[0] == 0 && state.smac[0] == 0) {
+        std::cerr << "ERROR: Session keys not initialized" << std::endl;
+        return apdu;
+    }
+
+    std::cout << "\n=== SCP03 EXTERNAL AUTHENTICATE ===" << std::endl;
+
+    unsigned char hostCryptogram[8];
+    if (!calculateSCP03Cryptogram(state.smac, state.hostChallenge, state.cardChallenge, hostCryptogram)) {
+        std::cerr << "Failed to calculate host cryptogram" << std::endl;
+        return apdu;
+    }
+
+    std::cout << "Host Cryptogram: ";
+    for (int i = 0; i < 8; i++) printf("%02X ", hostCryptogram[i]);
+    std::cout << std::endl;
+
+    apdu = { 0x84, 0x82, securityLevel, 0x00, 0x10 };
+    apdu.insert(apdu.end(), hostCryptogram, hostCryptogram + 8);
+    apdu.insert(apdu.end(), 8, 0x00);
+
+    std::vector<unsigned char> macInput;
+    macInput.insert(macInput.end(), state.macChaining, state.macChaining + 16);
+    macInput.insert(macInput.end(), apdu.begin(), apdu.begin() + 13);
+
+    unsigned char mac[16];
+    if (!performAES_CMAC(state.smac, macInput.data(), macInput.size(), mac)) {
+        std::cerr << "Failed to calculate MAC" << std::endl;
+        return {};
+    }
+
+    memcpy(state.macChaining, mac, 16);
+    memcpy(&apdu[13], mac, 8);
+
+    std::cout << "Command MAC: ";
+    for (int i = 0; i < 8; i++) printf("%02X ", mac[i]);
+    std::cout << std::endl;
+
+    std::cout << "Final Command: ";
+    for (auto b : apdu) printf("%02X ", b);
+    std::cout << std::endl;
+
+    state.securityLevel = securityLevel;
+    state.channelActive = true;
+
+    return apdu;
+}
+
+void SmartCardCryptoSCP03::addISO9797_M2Padding(std::vector<unsigned char>& data) {
+    data.push_back(0x80);
+    while (data.size() % 16 != 0) {
+        data.push_back(0x00);
+    }
+}
+
+void SmartCardCryptoSCP03::removeISO9797_M2Padding(std::vector<unsigned char>& data) {
+    while (!data.empty() && data.back() == 0x00) {
+        data.pop_back();
+    }
+    if (!data.empty() && data.back() == 0x80) {
+        data.pop_back();
+    }
+}
+
+bool SmartCardCryptoSCP03::calculateCommandMAC(const std::vector<unsigned char>& apdu,
+    unsigned char* mac) {
+    std::vector<unsigned char> macInput;
+    macInput.insert(macInput.end(), state.macChaining, state.macChaining + 16);
+    macInput.insert(macInput.end(), apdu.begin(), apdu.end());
+
+    unsigned char fullMac[16];
+    if (!performAES_CMAC(state.smac, macInput.data(), macInput.size(), fullMac)) {
+        return false;
+    }
+
+    memcpy(state.macChaining, fullMac, 16);
+    memcpy(mac, fullMac, 8);
+    return true;
+}
+
+std::vector<unsigned char> SmartCardCryptoSCP03::wrapCommandAPDU(const std::vector<unsigned char>& plainAPDU) {
+    if (!state.channelActive) {
+        std::cerr << "Secure channel not active" << std::endl;
+        return plainAPDU;
+    }
+
+    if (plainAPDU.size() < 4) {
+        std::cerr << "Invalid APDU" << std::endl;
+        return plainAPDU;
+    }
+
+    std::vector<unsigned char> wrappedAPDU;
+
+    uint8_t cla = plainAPDU[0];
+    uint8_t ins = plainAPDU[1];
+    uint8_t p1 = plainAPDU[2];
+    uint8_t p2 = plainAPDU[3];
+
+    cla |= 0x04;
+
+    bool hasMac = (state.securityLevel & 0x01) != 0;
+    bool hasEnc = (state.securityLevel & 0x02) != 0;
+
+    wrappedAPDU.push_back(cla);
+    wrappedAPDU.push_back(ins);
+    wrappedAPDU.push_back(p1);
+    wrappedAPDU.push_back(p2);
+
+    std::vector<unsigned char> data;
+    if (plainAPDU.size() > 5) {
+        uint8_t lc = plainAPDU[4];
+        if (plainAPDU.size() >= 5 + lc) {
+            data.insert(data.end(), plainAPDU.begin() + 5, plainAPDU.begin() + 5 + lc);
+        }
+    }
+
+    if (hasEnc && !data.empty()) {
+        addISO9797_M2Padding(data);
+
+        std::vector<unsigned char> encrypted(data.size());
+        if (!performAES_CBC_Encrypt(state.senc, state.encCounter,
+            data.data(), encrypted.data(), data.size())) {
+            std::cerr << "Encryption failed" << std::endl;
+            return plainAPDU;
+        }
+        data = encrypted;
+    }
+
+    size_t finalLc = data.size() + (hasMac ? 8 : 0);
+    wrappedAPDU.push_back((uint8_t)finalLc);
+    wrappedAPDU.insert(wrappedAPDU.end(), data.begin(), data.end());
+
+    if (hasMac) {
+        unsigned char mac[8];
+        if (!calculateCommandMAC(wrappedAPDU, mac)) {
+            std::cerr << "MAC calculation failed" << std::endl;
+            return plainAPDU;
+        }
+        wrappedAPDU.insert(wrappedAPDU.end(), mac, mac + 8);
+        wrappedAPDU[4] = (uint8_t)finalLc;
+    }
+
+    return wrappedAPDU;
+}
+
+std::vector<unsigned char> SmartCardCryptoSCP03::unwrapResponseAPDU(const std::vector<unsigned char>& wrappedResponse) {
+    if (!state.channelActive) {
+        return wrappedResponse;
+    }
+    return wrappedResponse;
+}
+
+bool SmartCardCryptoSCP03::isSecureChannelActive() const {
+    return state.channelActive;
+}
+
+uint8_t SmartCardCryptoSCP03::getSecurityLevel() const {
+    return state.securityLevel;
+}
+
+uint32_t SmartCardCryptoSCP03::getCommandCounter() const {
+    return state.commandCounter;
+}
+
+void SmartCardCryptoSCP03::printSessionKeys() const {
+    std::cout << "\n=== SCP03 SESSION KEYS ===" << std::endl;
+    std::cout << "S-ENC:  ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.senc[i]);
+    std::cout << "\nS-MAC:  ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.smac[i]);
+    std::cout << "\nS-RMAC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.srmac[i]);
+    std::cout << std::endl;
+}
+
+void SmartCardCryptoSCP03::printMacChainingValue() const {
+    std::cout << "MAC Chaining: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.macChaining[i]);
+    std::cout << std::endl;
+}
+
+void SmartCardCryptoSCP03::resetChannel() {
+    memset(&state, 0, sizeof(state));
+    state.channelActive = false;
+    state.securityLevel = 0;
+    state.commandCounter = 0;
+    std::cout << "SCP03 channel reset" << std::endl;
+}

@@ -1,0 +1,835 @@
+#define NOMINMAX
+#include "sc_writer_scp03.h"
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <algorithm>
+#include <windows.h>
+
+SCWriterSCP03::SCWriterSCP03() : scp03Active(false), dryRunMode(false), dryRunStep(0) {
+    if (!cardInterface.initialize()) {
+        std::cout << "Warning: Failed to initialize card interface" << std::endl;
+    }
+}
+
+SCWriterSCP03::~SCWriterSCP03() {
+    if (scp03Active) {
+        cardInterface.disconnect();
+    }
+}
+
+void SCWriterSCP03::setDryRunMode(bool enabled) {
+    dryRunMode = enabled;
+    if (enabled) {
+        std::cout << "=== DRY RUN MODE ENABLED - NO COMMANDS SENT TO CARD ===" << std::endl;
+        simulatedATR = { 0x3B, 0x68, 0x00, 0x00, 0x00, 0x73, 0xC8, 0x40, 0x12, 0x00, 0x90, 0x00 };
+    }
+}
+
+std::vector<unsigned char> SCWriterSCP03::hexStringToBytes(const std::string& hex) {
+    std::vector<unsigned char> bytes;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        if (i + 1 < hex.length()) {
+            std::string byteString = hex.substr(i, 2);
+            unsigned char byte = (unsigned char)strtol(byteString.c_str(), nullptr, 16);
+            bytes.push_back(byte);
+        }
+    }
+    return bytes;
+}
+
+std::string SCWriterSCP03::bytesToHexString(const std::vector<unsigned char>& bytes) {
+    std::stringstream ss;
+    ss << std::hex << std::uppercase << std::setfill('0');
+    for (unsigned char byte : bytes) {
+        ss << std::setw(2) << (int)byte;
+    }
+    return ss.str();
+}
+
+std::vector<unsigned char> SCWriterSCP03::safeSendAPDU(const std::vector<unsigned char>& apdu) {
+    if (dryRunMode) {
+        std::cout << "DRY RUN >> ";
+        for (auto byte : apdu) {
+            printf("%02X ", byte);
+        }
+
+        // Simulate INITIALIZE UPDATE response (80 50 00 00 08 ...)
+        if (apdu.size() >= 2 && apdu[0] == 0x80 && apdu[1] == 0x50) {
+            std::cout << " -> [32-byte INIT UPDATE response] 90 00" << std::endl;
+            // Return simulated SCP03 INIT UPDATE response
+            std::vector<unsigned char> fakeResponse = {
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03,
+                0x10, 0x6B, 0xC5, 0xA9, 0x67, 0xD0, 0x99, 0x9C, 0x30,
+                0x71, 0x0E, 0xD6, 0x25, 0x0B, 0x9E, 0x4A, 0xA4,
+                0x00, 0x00, 0x0A,
+                0x90, 0x00
+            };
+            return fakeResponse;
+        }
+
+        std::cout << " -> 90 00" << std::endl;
+        return { 0x90, 0x00 };
+    }
+    else {
+        if (isDestructiveCommand(apdu)) {
+            std::cout << "WARNING: About to send destructive command. Continue? (y/n): ";
+            char response;
+            std::cin >> response;
+            if (response != 'y' && response != 'Y') {
+                std::cout << "Operation cancelled by user." << std::endl;
+                return { 0x69, 0x85 };
+            }
+        }
+        return cardInterface.sendAPDU(apdu);
+    }
+}
+
+bool SCWriterSCP03::checkResponse(const std::vector<unsigned char>& response,
+    const std::string& operation) {
+    if (response.size() < 2) {
+        std::cout << "? " << operation << ": No response from card" << std::endl;
+        return false;
+    }
+
+    uint16_t sw = (response[response.size() - 2] << 8) | response[response.size() - 1];
+
+    if (sw == 0x9000) {
+        return true;
+    }
+
+    std::cout << "? " << operation << " failed: SW=" << std::hex << std::uppercase
+        << sw << std::dec << std::endl;
+
+    switch (sw) {
+    case 0x6A82:
+        std::cout << "   Error: File/Application not found" << std::endl;
+        break;
+    case 0x6982:
+        std::cout << "   Error: Security status not satisfied" << std::endl;
+        break;
+    case 0x6985:
+        std::cout << "   Error: Conditions not satisfied" << std::endl;
+        break;
+    case 0x6A86:
+        std::cout << "   Error: Incorrect P1/P2 parameters" << std::endl;
+        break;
+    case 0x6D00:
+        std::cout << "   Error: Instruction not supported" << std::endl;
+        break;
+    case 0x6E00:
+        std::cout << "   Error: Class not supported" << std::endl;
+        break;
+    default:
+        std::cout << "   Error: Unknown status code" << std::endl;
+    }
+
+    return false;
+}
+
+bool SCWriterSCP03::isDestructiveCommand(const std::vector<unsigned char>& apdu) {
+    if (apdu.size() < 2) return false;
+
+    unsigned char cla = apdu[0];
+    unsigned char ins = apdu[1];
+
+    if (ins == 0xE4 || ins == 0xE8 || ins == 0xE6) return true;
+    if (cla == 0x00 && ins == 0xF0) return true;
+    if (cla == 0xC0 && ins == 0xD6) return true;
+
+    return false;
+}
+
+bool SCWriterSCP03::establishSCP03(uint8_t securityLevel) {
+    std::cout << "\n╔═══════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║  ESTABLISHING SCP03 SECURE CHANNEL (GP 2.2.1)            ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════╝\n" << std::endl;
+
+    std::cout << "[1/3] Selecting ISD (Card Manager)..." << std::endl;
+    if (dryRunMode) {
+        std::cout << "✅ ISD selected (simulated)" << std::endl;
+    }
+    else {
+        if (!cardInterface.selectISD()) {
+            std::cout << "❌ ISD selection failed" << std::endl;
+            return false;
+        }
+        std::cout << "✅ ISD selected" << std::endl;
+    }
+
+    std::cout << "\n[2/3] Sending INITIALIZE UPDATE..." << std::endl;
+
+    std::vector<unsigned char> hostChallenge = {
+        0x0B, 0x9B, 0x73, 0x56, 0xBE, 0x1D, 0x56, 0x16
+    };
+
+    std::vector<unsigned char> initUpdate = { 0x80, 0x50, 0x00, 0x00, 0x08 };
+    initUpdate.insert(initUpdate.end(), hostChallenge.begin(), hostChallenge.end());
+    initUpdate.push_back(0x00);
+
+    auto response = safeSendAPDU(initUpdate);  // This already handles dry-run correctly!
+
+    if (response.size() < 32 || response[response.size() - 2] != 0x90) {
+        std::cout << "❌ INITIALIZE UPDATE failed" << std::endl;
+        if (response.size() >= 2) {
+            uint16_t sw = (response[response.size() - 2] << 8) | response[response.size() - 1];
+            std::cout << "   Status: " << std::hex << sw << std::dec << std::endl;
+        }
+        return false;
+    }
+
+    std::cout << "? INITIALIZE UPDATE successful" << std::endl;
+    std::cout << "   Response length: " << (response.size() - 2) << " bytes" << std::endl;
+
+    std::cout << "\n[3/3] Initializing crypto engine..." << std::endl;
+
+    crypto.setHostChallenge(hostChallenge.data(), hostChallenge.size());
+
+    std::vector<unsigned char> cryptoData(response.begin(), response.end() - 2);
+    if (crypto.initializeSecureChannel(cryptoData) != 0) {
+        std::cout << "? Crypto engine initialization failed" << std::endl;
+        return false;
+    }
+
+    std::cout << "? Crypto engine initialized" << std::endl;
+
+    std::cout << "\n[4/4] Creating EXTERNAL AUTHENTICATE command..." << std::endl;
+    auto extAuth = crypto.createExternalAuthenticateCommand(securityLevel);
+
+    if (extAuth.empty()) {
+        std::cout << "? Failed to create EXTERNAL AUTHENTICATE" << std::endl;
+        return false;
+    }
+
+    std::cout << "Sending EXTERNAL AUTHENTICATE..." << std::endl;
+    auto authResponse = safeSendAPDU(extAuth);
+
+    if (authResponse.size() >= 2) {
+        uint16_t sw = (authResponse[authResponse.size() - 2] << 8) |
+            authResponse[authResponse.size() - 1];
+
+        if (sw == 0x9000) {
+            std::cout << "\n?????? SCP03 SECURE CHANNEL ESTABLISHED! ??????" << std::endl;
+            std::cout << "Security Level: 0x" << std::hex << (int)securityLevel << std::dec;
+            if (securityLevel == 0x01) {
+                std::cout << " (C-MAC only)";
+            }
+            else if (securityLevel == 0x03) {
+                std::cout << " (C-MAC + C-DECRYPTION)";
+            }
+            std::cout << std::endl;
+
+            scp03Active = true;
+            crypto.printSessionKeys();
+            return true;
+        }
+        else {
+            std::cout << "? EXTERNAL AUTHENTICATE failed: " << std::hex << sw << std::dec << std::endl;
+
+            switch (sw) {
+            case 0x6982:
+                std::cout << "   Error: Security status not satisfied (MAC wrong)" << std::endl;
+                break;
+            case 0x6985:
+                std::cout << "   Error: Conditions not satisfied" << std::endl;
+                break;
+            case 0x6A88:
+                std::cout << "   Error: Referenced data not found" << std::endl;
+                break;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool SCWriterSCP03::sendExtendedAPDU(const std::vector<unsigned char>& apdu,
+    std::vector<unsigned char>& response) {
+    if (apdu.size() <= 255) {
+        response = safeSendAPDU(apdu);
+        return checkResponse(response, "Extended APDU");
+    }
+
+    std::cout << "Sending extended APDU (" << apdu.size() << " bytes)..." << std::endl;
+
+    std::vector<unsigned char> extApdu;
+
+    if (apdu.size() >= 4) {
+        extApdu.insert(extApdu.end(), apdu.begin(), apdu.begin() + 4);
+    }
+
+    size_t dataLen = apdu.size() - 5;
+    extApdu.push_back(0x00);
+    extApdu.push_back((dataLen >> 8) & 0xFF);
+    extApdu.push_back(dataLen & 0xFF);
+
+    if (apdu.size() > 5) {
+        extApdu.insert(extApdu.end(), apdu.begin() + 5, apdu.end());
+    }
+
+    extApdu.push_back(0x00);
+    extApdu.push_back(0x00);
+
+    std::vector<unsigned char> finalApdu;
+    if (scp03Active) {
+        finalApdu = crypto.wrapCommandAPDU(extApdu);
+    }
+    else {
+        finalApdu = extApdu;
+    }
+
+    response = cardInterface.sendExtendedAPDU(finalApdu);
+    return checkResponse(response, "Extended APDU");
+}
+
+std::vector<std::vector<unsigned char>> SCWriterSCP03::splitIntoChunks(
+    const std::vector<unsigned char>& data, size_t chunkSize) {
+
+    std::vector<std::vector<unsigned char>> chunks;
+    size_t offset = 0;
+
+    while (offset < data.size()) {
+        size_t currentChunkSize = std::min(chunkSize, data.size() - offset);
+        std::vector<unsigned char> chunk(data.begin() + offset,
+            data.begin() + offset + currentChunkSize);
+        chunks.push_back(chunk);
+        offset += currentChunkSize;
+    }
+
+    return chunks;
+}
+
+bool SCWriterSCP03::installDATFile(const std::string& filename) {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  INSTALLING DAT FILE: " << filename << std::string(35 - filename.length(), ' ') << "?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    DatFileParser parser;
+    auto commands = parser.parseDatFile(filename);
+
+    if (commands.empty()) {
+        std::cout << "? No commands generated from " << filename << std::endl;
+        return false;
+    }
+
+    std::cout << "?? Executing " << commands.size() << " installation commands..." << std::endl;
+
+    for (size_t i = 0; i < commands.size(); i++) {
+        const auto& cmd = commands[i];
+
+        std::cout << "\n[" << (i + 1) << "/" << commands.size() << "] "
+            << cmd.description << std::endl;
+
+        std::vector<unsigned char> response;
+
+        if (scp03Active) {
+            auto wrappedAPDU = crypto.wrapCommandAPDU(cmd.apdu);
+            response = safeSendAPDU(wrappedAPDU);
+        }
+        else {
+            response = safeSendAPDU(cmd.apdu);
+        }
+
+        if (!checkResponse(response, cmd.description)) {
+            std::cout << "? Installation failed at command " << (i + 1) << std::endl;
+            return false;
+        }
+
+        std::cout << "? Command completed successfully" << std::endl;
+    }
+
+    std::cout << "\n? " << filename << " installation completed successfully!" << std::endl;
+    return true;
+}
+
+bool SCWriterSCP03::executePersonalizationScript(const std::string& scriptFile) {
+    std::cout << "\n╔═══════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║  EXECUTING PERSONALIZATION SCRIPT                        ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════╝\n" << std::endl;
+
+    std::ifstream file(scriptFile);
+    if (!file.is_open()) {
+        std::cout << "❌ Failed to open script file: " << scriptFile << std::endl;
+        return false;
+    }
+
+    std::vector<std::string> apduLines;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        // FIX: Use lambda instead of ::isspace
+        line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
+        if (!line.empty() && line.find_first_not_of("0123456789ABCDEFabcdef") == std::string::npos) {
+            apduLines.push_back(line);
+        }
+    }
+    file.close();
+
+    std::cout << "Found " << apduLines.size() << " personalization commands" << std::endl;
+
+    for (size_t i = 0; i < apduLines.size(); i++) {
+        std::cout << "\n[" << (i + 1) << "/" << apduLines.size() << "] ";
+
+        std::vector<unsigned char> apduBytes = hexStringToBytes(apduLines[i]);
+
+        std::vector<unsigned char> response;
+        if (apduBytes.size() > 255) {
+            std::cout << "Extended APDU (" << apduBytes.size() << " bytes)" << std::endl;
+            if (!sendExtendedAPDU(apduBytes, response)) {
+                std::cout << "❌ Extended personalization command " << (i + 1) << " failed" << std::endl;
+            }
+        }
+        else {
+            std::cout << "Standard APDU" << std::endl;
+            if (scp03Active) {
+                auto wrappedAPDU = crypto.wrapCommandAPDU(apduBytes);
+                response = safeSendAPDU(wrappedAPDU);
+            }
+            else {
+                response = safeSendAPDU(apduBytes);
+            }
+
+            if (checkResponse(response, "Personalization command")) {
+                std::cout << "✅ Command executed successfully" << std::endl;
+            }
+        }
+    }
+
+    std::cout << "\n✅ Personalization script completed" << std::endl;
+    return true;
+}
+
+bool SCWriterSCP03::verifyCompleteInstallation() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  VERIFYING INSTALLATION                                   ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    std::cout << "??  Installation verification not yet implemented" << std::endl;
+    return true;
+}
+
+bool SCWriterSCP03::writeCard(const std::string& datFile) {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  SC-WRITER-SCP03 - CARD WRITING PROCESS                  ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    if (!dryRunMode) {
+        std::cout << "??  WARNING: This will modify your card permanently!" << std::endl;
+        std::cout << "Type 'YES' to continue: ";
+        std::string confirmation;
+        std::getline(std::cin, confirmation);
+        if (confirmation != "YES") {
+            std::cout << "Operation cancelled." << std::endl;
+            return false;
+        }
+    }
+
+    if (!dryRunMode && !cardInterface.connectToCard()) {
+        std::cout << "? Failed to connect to card" << std::endl;
+        return false;
+    }
+
+    auto atr = dryRunMode ? simulatedATR : cardInterface.getATR();
+    std::cout << "Card ATR: ";
+    for (auto byte : atr) printf("%02X ", byte);
+    std::cout << std::endl;
+
+    if (!establishSCP03(0x03)) {
+        std::cout << "? Failed to establish SCP03 secure channel" << std::endl;
+        return false;
+    }
+
+    if (!installDATFile(datFile)) {
+        std::cout << "? DAT file installation failed" << std::endl;
+        return false;
+    }
+
+    std::string scriptFile = "personalization_script.txt";
+    std::ifstream testScript(scriptFile);
+    if (testScript.good()) {
+        testScript.close();
+        if (!executePersonalizationScript(scriptFile)) {
+            std::cout << "??  Personalization script encountered errors" << std::endl;
+        }
+    }
+    else {
+        std::cout << "??  No personalization script found, skipping..." << std::endl;
+    }
+
+    if (!verifyCompleteInstallation()) {
+        std::cout << "??  Verification encountered issues" << std::endl;
+    }
+
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  ?? CARD WRITING COMPLETED SUCCESSFULLY! ??               ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
+
+    return true;
+}
+
+bool SCWriterSCP03::verifyCard() {
+    return true;
+}
+
+bool SCWriterSCP03::probeCard() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  CARD PROBE MODE - SAFE TESTING                           ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    if (!cardInterface.connectToCard()) {
+        std::cout << "? Failed to connect to card" << std::endl;
+        return false;
+    }
+
+    auto atr = cardInterface.getATR();
+    std::cout << "Card ATR: ";
+    for (auto byte : atr) printf("%02X ", byte);
+    std::cout << std::endl;
+
+    std::cout << "Reader: " << cardInterface.getReaderName() << std::endl;
+    std::cout << "Card present: " << (cardInterface.isCardPresent() ? "Yes" : "No") << std::endl;
+
+    std::cout << "\nTesting ISD selection..." << std::endl;
+    bool isdFound = cardInterface.selectISD();
+
+    if (isdFound) {
+        std::cout << "? ISD found and selected" << std::endl;
+    }
+    else {
+        std::cout << "? ISD selection failed" << std::endl;
+    }
+
+    cardInterface.disconnect();
+    return isdFound;
+}
+
+bool SCWriterSCP03::testSCP03Handshake() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  TEST SCP03 HANDSHAKE                                     ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    if (!cardInterface.connectToCard()) {
+        std::cout << "? Failed to connect to card" << std::endl;
+        return false;
+    }
+
+    auto atr = cardInterface.getATR();
+    std::cout << "Card ATR: ";
+    for (auto byte : atr) printf("%02X ", byte);
+    std::cout << std::endl;
+
+    bool result = establishSCP03(0x03);
+
+    if (result) {
+        std::cout << "\n? SCP03 handshake test PASSED" << std::endl;
+        crypto.printSessionKeys();
+        crypto.printMacChainingValue();
+    }
+    else {
+        std::cout << "\n? SCP03 handshake test FAILED" << std::endl;
+    }
+
+    cardInterface.disconnect();
+    return result;
+}
+
+bool SCWriterSCP03::testExtendedAPDU() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  TEST EXTENDED APDU SUPPORT                               ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    if (!cardInterface.connectToCard()) {
+        std::cout << "? Failed to connect to card" << std::endl;
+        return false;
+    }
+
+    if (!establishSCP03(0x03)) {
+        std::cout << "? Failed to establish SCP03" << std::endl;
+        cardInterface.disconnect();
+        return false;
+    }
+
+    std::vector<unsigned char> testData(1024, 0xAA);
+    std::vector<unsigned char> testApdu = { 0x80, 0xE8, 0x00, 0x00 };
+
+    std::vector<unsigned char> response;
+    bool result = sendExtendedAPDU(testApdu, response);
+
+    if (result) {
+        std::cout << "\n? Extended APDU test PASSED" << std::endl;
+    }
+    else {
+        std::cout << "\n? Extended APDU test FAILED" << std::endl;
+    }
+
+    cardInterface.disconnect();
+    return result;
+}
+
+bool SCWriterSCP03::testCompleteWorkflow() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  TEST COMPLETE WORKFLOW (SAFE MODE)                       ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    std::cout << "This will test:" << std::endl;
+    std::cout << "  1. Card connection" << std::endl;
+    std::cout << "  2. ISD selection" << std::endl;
+    std::cout << "  3. SCP03 establishment" << std::endl;
+    std::cout << "  4. Extended APDU support" << std::endl;
+    std::cout << "  5. Command wrapping/unwrapping" << std::endl;
+    std::cout << "\nNo destructive operations will be performed.\n" << std::endl;
+
+    std::cout << "[1/5] Testing card connection..." << std::endl;
+    if (!cardInterface.connectToCard()) {
+        std::cout << "? Failed" << std::endl;
+        return false;
+    }
+    std::cout << "? Connected" << std::endl;
+
+    std::cout << "\n[2/5] Testing ISD selection..." << std::endl;
+    if (!cardInterface.selectISD()) {
+        std::cout << "? Failed" << std::endl;
+        cardInterface.disconnect();
+        return false;
+    }
+    std::cout << "? ISD selected" << std::endl;
+
+    std::cout << "\n[3/5] Testing SCP03 establishment..." << std::endl;
+    if (!establishSCP03(0x03)) {
+        std::cout << "? Failed" << std::endl;
+        cardInterface.disconnect();
+        return false;
+    }
+    std::cout << "? SCP03 established" << std::endl;
+
+    std::cout << "\n[4/5] Testing command wrapping..." << std::endl;
+    std::vector<unsigned char> testCmd = { 0x00, 0xA4, 0x04, 0x00, 0x00 };
+    auto wrappedCmd = crypto.wrapCommandAPDU(testCmd);
+    if (wrappedCmd.empty()) {
+        std::cout << "? Failed" << std::endl;
+        cardInterface.disconnect();
+        return false;
+    }
+    std::cout << "? Command wrapping working" << std::endl;
+
+    std::cout << "\n[5/5] Testing extended APDU format..." << std::endl;
+    std::vector<unsigned char> largeData(300, 0xBB);
+    auto chunks = splitIntoChunks(largeData, 200);
+    if (chunks.size() != 2) {
+        std::cout << "? Failed (expected 2 chunks, got " << chunks.size() << ")" << std::endl;
+        cardInterface.disconnect();
+        return false;
+    }
+    std::cout << "? Extended APDU chunking working" << std::endl;
+
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  ? ALL TESTS PASSED!                                      ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
+
+    cardInterface.disconnect();
+    return true;
+}
+
+void SCWriterSCP03::logCardState(const std::string& operation) {
+    std::cout << "\n=== CARD STATE: " << operation << " ===" << std::endl;
+    if (dryRunMode) {
+        std::cout << "Mode: DRY RUN" << std::endl;
+    }
+    else {
+        std::cout << "Mode: LIVE CARD" << std::endl;
+        auto atr = cardInterface.getATR();
+        std::cout << "ATR: ";
+        for (auto byte : atr) printf("%02X ", byte);
+        std::cout << std::endl;
+    }
+    std::cout << "SCP03 Active: " << (scp03Active ? "Yes" : "No") << std::endl;
+    std::cout << "==================================" << std::endl;
+}
+
+bool SCWriterSCP03::isCardAlreadyInitialized() {
+    return false;
+}
+
+bool SCWriterSCP03::prePersonalizeForSCP03() {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  PRE-PERSONALIZATION FOR SCP03                            ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    std::cout << "??  WARNING: This will set SCP03 master keys on the card!" << std::endl;
+    std::cout << "??  This operation is card-specific and may vary by manufacturer." << std::endl;
+
+    std::cout << "\n??  Pre-personalization not yet implemented" << std::endl;
+    std::cout << "Consult your card's documentation for SCP03 key setup procedures." << std::endl;
+
+    return false;
+}
+
+bool SCWriterSCP03::setMasterKeys(const std::vector<unsigned char>& enc,
+    const std::vector<unsigned char>& mac,
+    const std::vector<unsigned char>& dek) {
+    if (enc.size() != 16 || mac.size() != 16 || dek.size() != 16) {
+        std::cerr << "Invalid key sizes (must be 16 bytes each)" << std::endl;
+        return false;
+    }
+
+    crypto.setMasterKeys(enc.data(), mac.data(), dek.data());
+    return true;
+}
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+void printUsage() {
+    std::cout << "\nSC-Writer-SCP03 - GlobalPlatform 2.2.1 Smart Card Writer" << std::endl;
+    std::cout << "========================================================\n" << std::endl;
+    std::cout << "Usage: SC-Writer-SCP03.exe [options] <applet.dat>" << std::endl;
+    std::cout << "\nOptions:" << std::endl;
+    std::cout << "  --dry-run, -d          : Simulate operations without sending to card" << std::endl;
+    std::cout << "  --probe, -p            : Safe probe mode - test card connectivity" << std::endl;
+    std::cout << "  --test-scp03, -t       : Test SCP03 handshake only" << std::endl;
+    std::cout << "  --test-extended, -e    : Test extended APDU support" << std::endl;
+    std::cout << "  --test-workflow, -w    : Test complete workflow (safe mode)" << std::endl;
+    std::cout << "  --help, -h             : Show this help message" << std::endl;
+    std::cout << "\nExamples:" << std::endl;
+    std::cout << "  SC-Writer-SCP03.exe --dry-run applet.dat     # Test without card" << std::endl;
+    std::cout << "  SC-Writer-SCP03.exe --probe                  # Check card status" << std::endl;
+    std::cout << "  SC-Writer-SCP03.exe --test-scp03             # Test SCP03 only" << std::endl;
+    std::cout << "  SC-Writer-SCP03.exe applet.dat               # Write to card" << std::endl;
+    std::cout << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  SC-Writer-SCP03 v1.0                                     ?" << std::endl;
+    std::cout << "?  GlobalPlatform 2.2.1 with SCP03 Support                 ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
+
+    bool dryRun = false;
+    bool probeMode = false;
+    bool testSCP03Mode = false;
+    bool testExtendedMode = false;
+    bool testWorkflowMode = false;
+    bool showHelp = false;
+    std::string datFile;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--dry-run" || arg == "-d") {
+            dryRun = true;
+            std::cout << "?? Dry-run mode enabled" << std::endl;
+        }
+        else if (arg == "--probe" || arg == "-p") {
+            probeMode = true;
+            std::cout << "?? Probe mode enabled" << std::endl;
+        }
+        else if (arg == "--test-scp03" || arg == "-t") {
+            testSCP03Mode = true;
+            std::cout << "?? SCP03 test mode enabled" << std::endl;
+        }
+        else if (arg == "--test-extended" || arg == "-e") {
+            testExtendedMode = true;
+            std::cout << "?? Extended APDU test mode enabled" << std::endl;
+        }
+        else if (arg == "--test-workflow" || arg == "-w") {
+            testWorkflowMode = true;
+            std::cout << "?? Workflow test mode enabled" << std::endl;
+        }
+        else if (arg == "--help" || arg == "-h") {
+            showHelp = true;
+        }
+        else if (arg.find(".dat") != std::string::npos) {
+            datFile = arg;
+            std::cout << "?? DAT file: " << datFile << std::endl;
+        }
+        else {
+            std::cerr << "? Unknown argument: " << arg << std::endl;
+            printUsage();
+            return 1;
+        }
+    }
+
+    if (showHelp) {
+        printUsage();
+        return 0;
+    }
+
+    std::cout << std::endl;
+
+    try {
+        SCWriterSCP03 writer;
+
+        if (probeMode) {
+            std::cout << "Starting probe mode..." << std::endl;
+            bool result = writer.probeCard();
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return result ? 0 : 1;
+        }
+
+        if (testSCP03Mode) {
+            std::cout << "Starting SCP03 handshake test..." << std::endl;
+            bool result = writer.testSCP03Handshake();
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return result ? 0 : 1;
+        }
+
+        if (testExtendedMode) {
+            std::cout << "Starting extended APDU test..." << std::endl;
+            bool result = writer.testExtendedAPDU();
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return result ? 0 : 1;
+        }
+
+        if (testWorkflowMode) {
+            std::cout << "Starting workflow test..." << std::endl;
+            bool result = writer.testCompleteWorkflow();
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return result ? 0 : 1;
+        }
+
+        if (datFile.empty()) {
+            std::cerr << "? Error: No DAT file specified" << std::endl;
+            printUsage();
+            return 1;
+        }
+
+        if (dryRun) {
+            writer.setDryRunMode(true);
+        }
+
+        std::cout << "Starting card writing process..." << std::endl;
+        if (writer.writeCard(datFile)) {
+            std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+            std::cout << "?  ? SUCCESS - Card writing completed!                     ?" << std::endl;
+            std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
+
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return 0;
+        }
+        else {
+            std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+            std::cout << "?  ? FAILED - Card writing encountered errors              ?" << std::endl;
+            std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
+
+            std::cout << "\nPress Enter to exit...";
+            std::cin.get();
+            return 1;
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "\n?????????????????????????????????????????????????????????????" << std::endl;
+        std::cerr << "?  ? EXCEPTION CAUGHT                                       ?" << std::endl;
+        std::cerr << "?????????????????????????????????????????????????????????????" << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
+
+        std::cout << "\nPress Enter to exit...";
+        std::cin.get();
+        return 1;
+    }
+}

@@ -1,0 +1,542 @@
+/*
+ * PC/SC Interface for Omnikey card readers
+ * Handles smart card communication
+ * FIXED: Unicode/ANSI conversion issues
+ */
+
+#include "pcsc_card_interface.h"
+#include <windows.h>
+#include <winscard.h>
+#include <vector>
+#include <iostream>
+#include <string>
+#include <iomanip>
+#include <fstream>
+#include <ctime>
+#include <sstream>
+
+#pragma comment(lib, "winscard.lib")
+
+PCScCardInterface::PCScCardInterface() : hContext(0), hCard(0), dwActiveProtocol(0), cardConnected(false) {}
+
+PCScCardInterface::~PCScCardInterface() { 
+    disconnect();
+    if (hContext) {
+        SCardReleaseContext(hContext);
+    }
+}
+
+// Helper function to convert string to wide string
+std::wstring PCScCardInterface::StringToWString(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+// Helper function to convert wide string to string
+std::string PCScCardInterface::WStringToString(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+bool PCScCardInterface::initialize() {
+    LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to establish PC/SC context: " << std::hex << rv << std::endl;
+        return false;
+    }
+
+    std::cout << "PC/SC context established" << std::endl;
+    return true;
+}
+
+std::vector<std::string> PCScCardInterface::listReaders() {
+    std::vector<std::string> readers;
+
+    DWORD dwReaders = SCARD_AUTOALLOCATE;
+    LPWSTR szReaders = NULL;
+
+    LONG rv = SCardListReadersW(hContext, NULL, (LPWSTR)&szReaders, &dwReaders);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to list readers: " << std::hex << rv << std::endl;
+        return readers;
+    }
+
+    // Parse multi-string (wide char version)
+    wchar_t* reader = szReaders;
+    while (*reader) {
+        std::wstring wReaderName(reader);
+        std::string readerName = WStringToString(wReaderName);
+        readers.push_back(readerName);
+        std::cout << "Found reader: " << readerName << std::endl;
+        reader += wcslen(reader) + 1;
+    }
+
+    SCardFreeMemory(hContext, szReaders);
+    return readers;
+}
+
+bool PCScCardInterface::connectToCard(const std::string& readerName) {
+    std::vector<std::string> readers = listReaders();
+    if (readers.empty()) {
+        std::cerr << "No card readers found" << std::endl;
+        return false;
+    }
+
+    std::string targetReader = readerName;
+    if (targetReader.empty()) {
+        // Look for Omnikey reader first
+        for (const auto& reader : readers) {
+            if (reader.find("OMNIKEY") != std::string::npos) {
+                targetReader = reader;
+                break;
+            }
+        }
+        // If no Omnikey found, use first available
+        if (targetReader.empty()) {
+            targetReader = readers[0];
+        }
+    }
+    std::cout << "Connecting to reader: " << targetReader << std::endl;
+
+    // Convert string to wide string for SCardConnectW
+    std::wstring wTargetReader = StringToWString(targetReader);
+
+    LONG rv = SCardConnectW(hContext,
+        wTargetReader.c_str(),
+        SCARD_SHARE_SHARED,
+        SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+        &hCard,
+        &dwActiveProtocol);
+
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to connect to card: " << std::hex << rv << std::endl;
+        return false;
+    }
+
+    cardConnected = true;
+    currentReaderName = targetReader; // Store the reader name
+    std::cout << "Connected to card, protocol: "
+        << (dwActiveProtocol == SCARD_PROTOCOL_T0 ? "T=0" : "T=1") << std::endl;
+
+    return true;
+}
+
+void PCScCardInterface::disconnect() {
+    if (cardConnected) {
+        // Use LEAVE_CARD (current approach)
+        SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+        cardConnected = false;
+        hCard = 0;
+        currentReaderName.clear();
+    }
+}
+
+void PCScCardInterface::disconnectWithReset() {
+    if (cardConnected) {
+        std::cout << "Disconnecting with card reset..." << std::endl;
+        LONG rv = SCardDisconnect(hCard, SCARD_RESET_CARD);
+        if (rv != SCARD_S_SUCCESS) {
+            std::cout << "Warning: Card reset disconnect failed: " << std::hex << rv << std::endl;
+        }
+        cardConnected = false;
+        hCard = 0;
+        currentReaderName.clear();
+    }
+}
+
+void PCScCardInterface::disconnectWithUnpower() {
+    if (cardConnected) {
+        std::cout << "Disconnecting with card unpower..." << std::endl;
+        LONG rv = SCardDisconnect(hCard, SCARD_UNPOWER_CARD);
+        if (rv != SCARD_S_SUCCESS) {
+            std::cout << "Warning: Card unpower disconnect failed: " << std::hex << rv << std::endl;
+        }
+        cardConnected = false;
+        hCard = 0;
+        currentReaderName.clear();
+    }
+}
+
+void PCScCardInterface::disconnectAndReleaseContext() {
+    if (cardConnected) {
+        std::cout << "Disconnecting and releasing context..." << std::endl;
+        SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+        cardConnected = false;
+        hCard = 0;
+        currentReaderName.clear();
+    }
+
+    if (hContext) {
+        std::cout << "Releasing PC/SC context..." << std::endl;
+        LONG rv = SCardReleaseContext(hContext);
+        if (rv != SCARD_S_SUCCESS) {
+            std::cout << "Warning: Context release failed: " << std::hex << rv << std::endl;
+        }
+        hContext = 0;
+    }
+}
+
+bool PCScCardInterface::forceReconnect(const std::string& readerName) {
+    std::cout << "Force reconnecting to card..." << std::endl;
+
+    // Store current reader if not specified
+    std::string targetReader = readerName;
+    if (targetReader.empty()) {
+        targetReader = currentReaderName;
+    }
+
+    // Try different disconnect approaches
+    disconnectWithReset();
+    Sleep(1000);
+
+    // If that fails, try unpower
+    if (!connectToCard(targetReader)) {
+        std::cout << "Reset disconnect failed, trying unpower..." << std::endl;
+        disconnectWithUnpower();
+        Sleep(2000);
+
+        if (!connectToCard(targetReader)) {
+            std::cout << "Unpower disconnect failed, trying context release..." << std::endl;
+            disconnectAndReleaseContext();
+
+            // Reinitialize completely
+            if (!initialize()) {
+                std::cout << "Failed to reinitialize PC/SC context" << std::endl;
+                return false;
+            }
+
+            Sleep(1000);
+            return connectToCard(targetReader);
+        }
+    }
+
+    return true;
+}
+
+std::vector<unsigned char> PCScCardInterface::sendAPDU(const std::vector<unsigned char>& apdu) {
+    // MORE ROBUST: Check actual card handle first, not just the flag
+    if (!hCard || hCard == 0) {
+        std::cerr << "No card handle available" << std::endl;
+        lastError = SCARD_E_INVALID_HANDLE;
+        return {};
+    }
+
+    // DEBUG: Log the cardConnected flag state
+    std::cout << "DEBUG: cardConnected flag = " << (cardConnected ? "true" : "false") << std::endl;
+    std::cout << "DEBUG: hCard handle = " << std::hex << hCard << std::dec << std::endl;
+
+    // FALLBACK: If cardConnected flag is false but we have a handle, try anyway
+    if (!cardConnected) {
+        std::cout << "WARNING: cardConnected flag is false, but attempting APDU anyway..." << std::endl;
+        // Don't return early - try to send the command
+    }
+
+    // Log outgoing APDU
+    std::cout << ">> ";
+    for (auto byte : apdu) {
+        printf("%02X ", byte);
+    }
+    std::cout << std::endl;
+
+    SCARD_IO_REQUEST pioSendPci;
+    if (dwActiveProtocol == SCARD_PROTOCOL_T0) {
+        pioSendPci = *SCARD_PCI_T0;
+    }
+    else {
+        pioSendPci = *SCARD_PCI_T1;
+    }
+
+    unsigned char response[256];
+    DWORD responseLen = sizeof(response);
+
+    // CRITICAL: Add timeout and retry logic
+    LONG rv = SCardTransmit(hCard,
+        &pioSendPci,
+        apdu.data(),
+        static_cast<DWORD>(apdu.size()),
+        NULL,
+        response,
+        &responseLen);
+
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "SCardTransmit failed: " << std::hex << rv << std::dec << std::endl;
+
+        // Enhanced error handling
+        switch (rv) {
+        case SCARD_W_REMOVED_CARD:
+            std::cout << "ERROR: Card was removed during transmission" << std::endl;
+            cardConnected = false;
+            break;
+        case SCARD_E_NO_SMARTCARD:
+            std::cout << "ERROR: No smart card in reader" << std::endl;
+            cardConnected = false;
+            break;
+        case SCARD_E_INVALID_HANDLE:
+            std::cout << "ERROR: Invalid card handle - connection may have been reset" << std::endl;
+            cardConnected = false;
+            break;
+        case SCARD_E_NOT_TRANSACTED:
+            std::cout << "ERROR: Transaction not active" << std::endl;
+            break;
+        case SCARD_W_UNRESPONSIVE_CARD:
+            std::cout << "ERROR: Card is unresponsive" << std::endl;
+            break;
+        default:
+            std::cout << "ERROR: SCardTransmit error: " << formatError(rv) << std::endl;
+            break;
+        }
+
+        lastError = rv;
+        return {};
+    }
+
+    // SUCCESS: If we got here, the connection is actually working
+    if (!cardConnected) {
+        std::cout << "SUCCESS: APDU transmitted despite cardConnected flag being false" << std::endl;
+        std::cout << "INFO: Fixing cardConnected flag..." << std::endl;
+        cardConnected = true; // Fix the flag
+    }
+
+    std::vector<unsigned char> result(response, response + responseLen);
+
+    // Log incoming response
+    std::cout << "<< ";
+    for (auto byte : result) {
+        printf("%02X ", byte);
+    }
+    std::cout << std::endl;
+
+    return result;
+}
+
+bool PCScCardInterface::isCardPresent() {
+    if (!cardConnected) return false;
+
+    DWORD dwState, dwProtocol;
+    DWORD dwAtrLen = SCARD_AUTOALLOCATE;
+    LPBYTE pbAtr = NULL;
+    DWORD dwReaderLen = SCARD_AUTOALLOCATE;
+    LPWSTR szReaderName = NULL;
+
+    LONG rv = SCardStatusW(hCard,
+        (LPWSTR)&szReaderName, &dwReaderLen,
+        &dwState, &dwProtocol,
+        (LPBYTE)&pbAtr, &dwAtrLen);
+
+    if (pbAtr) SCardFreeMemory(hContext, pbAtr);
+    if (szReaderName) SCardFreeMemory(hContext, szReaderName);
+
+    return (rv == SCARD_S_SUCCESS) && (dwState & SCARD_STATE_PRESENT);
+}
+
+std::vector<unsigned char> PCScCardInterface::getATR() {
+    if (!cardConnected) return {};
+
+    DWORD dwAtrLen = SCARD_AUTOALLOCATE;
+    LPBYTE pbAtr = NULL;
+    DWORD dwReaderLen = SCARD_AUTOALLOCATE;
+    LPWSTR szReaderName = NULL;
+    DWORD dwState, dwProtocol;
+
+    LONG rv = SCardStatusW(hCard,
+        (LPWSTR)&szReaderName, &dwReaderLen,
+        &dwState, &dwProtocol,
+        (LPBYTE)&pbAtr, &dwAtrLen);
+
+    std::vector<unsigned char> atr;
+    if (rv == SCARD_S_SUCCESS && pbAtr) {
+        atr.assign(pbAtr, pbAtr + dwAtrLen);
+        SCardFreeMemory(hContext, pbAtr);
+    }
+
+    if (szReaderName) SCardFreeMemory(hContext, szReaderName);
+
+    return atr;
+}
+
+// NEW MISSING METHODS THAT YOUR CODE NEEDS:
+
+const std::string& PCScCardInterface::getReaderName() const {
+    return currentReaderName;
+}
+
+std::string PCScCardInterface::getLastError() const {
+    return formatError(lastError);
+}
+
+std::string PCScCardInterface::formatError(LONG error) const {
+    switch (error) {
+    case SCARD_S_SUCCESS:
+        return "Success";
+    case SCARD_E_NO_READERS_AVAILABLE:
+        return "No readers available";
+    case SCARD_E_NO_SMARTCARD:
+        return "No smart card in reader";
+    case SCARD_E_CARD_UNSUPPORTED:
+        return "Card not supported";
+    case SCARD_E_READER_UNAVAILABLE:
+        return "Reader unavailable";
+    case SCARD_W_REMOVED_CARD:
+        return "Card removed";
+    case SCARD_E_TIMEOUT:
+        return "Timeout";
+    default:
+        return "Unknown error: 0x" + std::to_string(error);
+    }
+}
+
+// Helper to hex-dump a vector
+static std::string hexvec(const std::vector<unsigned char>& v) {
+    std::ostringstream o;
+    for (auto b : v) o << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+    return o.str();
+}
+
+static std::string timestamp_now() {
+    std::time_t t = std::time(nullptr);
+    struct tm local;
+    localtime_s(&local, &t);   // safer replacement
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%F %T", &local);
+    return std::string(buf);
+}
+
+bool PCScCardInterface::selectISD() {
+    std::ofstream log("isd_probe_log.txt", std::ios::app);
+    if (!log.is_open()) {
+        std::cerr << "Failed to open isd_probe_log.txt for logging" << std::endl;
+        return false;
+    }
+
+    log << "=== ISD probe started ===\n";
+
+    std::vector<std::vector<unsigned char>> isdAids = {
+        {0xA0,0x00,0x00,0x00,0x03,0x00,0x00,0x00},
+        {0xA0,0x00,0x00,0x00,0x03,0x00,0x00},
+        {0xA0,0x00,0x00,0x00,0x01,0x51,0x00,0x00},
+        {0xA0,0x00,0x00,0x01,0x51,0x00,0x00,0x00},
+        {0xA0,0x00,0x00,0x00,0x62,0x03,0x01,0x08,0x01},  // JCOP
+        {0xA0,0x00,0x00,0x00,0x18,0x43,0x4D},              // Card Manager
+        {0xA0,0x00,0x00,0x00,0x03},                        // Simplified GP
+        {0xA0,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x01},    // Extended GP
+        {0xD2,0x76,0x00,0x01,0x24,0x01},                   // NXP specific
+        {}  // Empty -> try MF select
+    };
+
+    std::vector<unsigned char> p2_variants = { 0x00, 0x04, 0x0C };
+
+    for (size_t i = 0; i < isdAids.size(); ++i) {
+        const auto& aid = isdAids[i];
+
+        if (aid.empty()) {
+            // Try SELECT MF (Master File = 3F00)
+            std::vector<unsigned char> apdu = { 0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00 };
+            log << "[MF SELECT] APDU: " << hexvec(apdu) << "\n";
+            std::vector<unsigned char> resp = this->sendAPDU(apdu);
+
+            if (resp.size() >= 2) {
+                unsigned char sw1 = resp[resp.size() - 2];
+                unsigned char sw2 = resp[resp.size() - 1];
+                std::vector<unsigned char> data(resp.begin(), resp.end() - 2);
+                log << "   -> SW: " << std::hex << std::setw(2) << std::setfill('0') << (int)sw1
+                    << std::setw(2) << (int)sw2
+                    << "  RESP: " << hexvec(data) << "\n";
+            }
+            else {
+                log << "   -> No response\n";
+            }
+            continue;
+        }
+
+        for (auto p2 : p2_variants) {
+            // Build SELECT by name: 00 A4 04 <P2> Lc <AID>
+            std::vector<unsigned char> apdu;
+            apdu.push_back(0x00);
+            apdu.push_back(0xA4);
+            apdu.push_back(0x04);   // P1 = select by name
+            apdu.push_back(p2);     // P2 variant
+            apdu.push_back(static_cast<unsigned char>(aid.size()));
+            apdu.insert(apdu.end(), aid.begin(), aid.end());
+
+            log << "[AID idx=" << i << "] P2=0x" << std::hex << (int)p2
+                << " APDU: " << hexvec(apdu) << "\n";
+
+            std::vector<unsigned char> resp = this->sendAPDU(apdu);
+            if (resp.size() < 2) {
+                log << "   -> No response\n";
+                continue;
+            }
+
+            unsigned char sw1 = resp[resp.size() - 2];
+            unsigned char sw2 = resp[resp.size() - 1];
+            std::vector<unsigned char> data(resp.begin(), resp.end() - 2);
+
+            log << "   -> SW: " << std::hex << std::setw(2) << std::setfill('0') << (int)sw1
+                << std::setw(2) << (int)sw2
+                << "  RESP: " << hexvec(data) << "\n";
+
+            if (sw1 == 0x61) {
+                // 61xx means "more data available" -> GET RESPONSE
+                unsigned char le = sw2;
+                std::vector<unsigned char> getResp = { 0x00, 0xC0, 0x00, 0x00, le };
+                log << "   -> GET RESPONSE APDU: " << hexvec(getResp) << "\n";
+
+                std::vector<unsigned char> gresp = this->sendAPDU(getResp);
+                if (gresp.size() >= 2) {
+                    unsigned char gsw1 = gresp[gresp.size() - 2];
+                    unsigned char gsw2 = gresp[gresp.size() - 1];
+                    std::vector<unsigned char> gdata(gresp.begin(), gresp.end() - 2);
+
+                    log << "      GET RESP -> SW: "
+                        << std::hex << std::setw(2) << (int)gsw1
+                        << std::setw(2) << (int)gsw2
+                        << "  DATA: " << hexvec(gdata) << "\n";
+                }
+                else {
+                    log << "      GET RESPONSE failed (no data)\n";
+                }
+            }
+
+            if (sw1 == 0x90 && sw2 == 0x00) {
+                log << "=== ISD SELECTED (AID idx=" << i
+                    << ", P2=0x" << std::hex << (int)p2 << ") ===\n";
+                log.close();
+                return true;
+            }
+        }
+    }
+
+    log << "=== ISD probe finished: no ISD SELECT succeeded ===\n";
+    log.close();
+    return false;
+}
+
+// =============================================================================
+// HELPER FUNCTIONS FOR EXTENDED APDU SUPPORT
+// =============================================================================
+
+std::vector<unsigned char> PCScCardInterface::sendExtendedAPDU(const std::vector<unsigned char>& apdu) {
+    // For now, just use regular sendAPDU
+    // TODO: Implement APDU chaining if needed for >255 byte commands
+    if (apdu.size() <= 255) {
+        return sendAPDU(apdu);
+    }
+
+    std::cout << "WARNING: Extended APDU not yet implemented, using regular send" << std::endl;
+    return sendAPDU(apdu);
+}
+
+void PCScCardInterface::storeInitUpdateResponse(const std::vector<unsigned char>& response) {
+    storedInitUpdateResponse = response;
+    std::cout << "PCSC: Stored INIT UPDATE response (" << response.size() << " bytes)" << std::endl;
+}
+
+const std::vector<unsigned char>& PCScCardInterface::getStoredInitUpdateResponse() const {
+    return storedInitUpdateResponse;
+}
