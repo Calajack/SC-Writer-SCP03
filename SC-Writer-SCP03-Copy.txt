@@ -5,6 +5,7 @@
 #include <fstream>
 #include <algorithm>
 #include <windows.h>
+#include "crypto_engine_scp03.h"
 
 SCWriterSCP03::SCWriterSCP03() : scp03Active(false), dryRunMode(false), dryRunStep(0) {
     if (!cardInterface.initialize()) {
@@ -662,6 +663,8 @@ bool SCWriterSCP03::testCompleteWorkflow() {
     }
     std::cout << "? ISD selected" << std::endl;
 
+    getCardInformation();  // This retrieves CPLC data for diversification
+
     std::cout << "\n[3/5] Testing SCP03 establishment..." << std::endl;
     if (!establishSCP03(0x03, true)) {  // true = skip ISD selection
         std::cout << "? Failed" << std::endl;
@@ -701,28 +704,23 @@ bool SCWriterSCP03::testCompleteWorkflow() {
 bool SCWriterSCP03::getCardInformation() {
     std::cout << "\n==============================================================" << std::endl;
     std::cout << "?  GETTING CARD INFORMATION FOR DIVERSIFICATION ANALYSIS    ?" << std::endl;
-    std::cout << "=============================================================\n" << std::endl;
+    std::cout << "==============================================================\n" << std::endl;
 
-    if (!cardInterface.connectToCard()) {
-        std::cout << "? Failed to connect to card" << std::endl;
-        return false;
-    }
-
-    // First, let's get CPLC data (Card Production Life Cycle)
-    std::cout << "\n[1] Getting CPLC Data (Card Production Life Cycle)..." << std::endl;
+    // Just assume the card is connected since we're in the middle of workflow
+    std::cout << "[1] Getting CPLC Data (Card Production Life Cycle)..." << std::endl;
     std::cout << "This contains the card serial number used for diversification" << std::endl;
 
     std::vector<unsigned char> getCPLC = { 0x80, 0xCA, 0x9F, 0x7F, 0x00 };
     auto cplcResp = cardInterface.sendAPDU(getCPLC);
 
-    if (cplcResp.size() >= 2 && cplcResp[cplcResp.size() - 2] == 0x90) {
+    if (cplcResp.size() >= 2 && cplcResp[cplcResp.size() - 2] == 0x90 && cplcResp[cplcResp.size() - 1] == 0x00) {
         std::cout << "CPLC Data: ";
         for (size_t i = 0; i < cplcResp.size() - 2; i++) {
             printf("%02X ", cplcResp[i]);
         }
         std::cout << std::endl;
 
-        if (cplcResp.size() >= 42) {  // Standard CPLC is 42 bytes
+        if (cplcResp.size() >= 14) {  // We only need the first 14 bytes for IC Serial
             std::cout << "\nCPLC Breakdown:" << std::endl;
             std::cout << "  IC Fabricator: ";
             for (int i = 0; i < 2; i++) printf("%02X ", cplcResp[i]);
@@ -736,78 +734,24 @@ bool SCWriterSCP03::getCardInformation() {
             for (int i = 4; i < 6; i++) printf("%02X ", cplcResp[i]);
             std::cout << std::endl;
 
-            std::cout << "  OS Release Date: ";
-            for (int i = 6; i < 8; i++) printf("%02X ", cplcResp[i]);
-            std::cout << std::endl;
-
-            std::cout << "  OS Release Level: ";
-            for (int i = 8; i < 10; i++) printf("%02X ", cplcResp[i]);
-            std::cout << std::endl;
-
             std::cout << "  IC Serial Number: ";
             for (int i = 10; i < 14; i++) printf("%02X ", cplcResp[i]);
-            std::cout << " <- Often used for diversification!" << std::endl;
+            std::cout << " <- Used for diversification!" << std::endl;
 
-            std::cout << "  IC Batch ID: ";
-            for (int i = 14; i < 16; i++) printf("%02X ", cplcResp[i]);
-            std::cout << std::endl;
+            // Extract IC Serial for diversification
+            std::vector<unsigned char> diversificationData;
+            diversificationData.insert(diversificationData.end(), cplcResp.begin() + 10, cplcResp.begin() + 14);
+
+            crypto.setDiversificationData(diversificationData);
+            std::cout << "? Diversification data set successfully" << std::endl;
+            return true;
         }
     }
     else {
-        std::cout << "Failed to get CPLC data" << std::endl;
+        std::cout << "? Could not retrieve CPLC data, will use default diversification" << std::endl;
     }
 
-    // Get Card Data
-    std::cout << "\n[2] Getting Card Data..." << std::endl;
-    std::vector<unsigned char> getCardData = { 0x00, 0xCA, 0x00, 0x66, 0x00 };
-    auto cardDataResp = cardInterface.sendAPDU(getCardData);
-
-    if (cardDataResp.size() >= 2 && cardDataResp[cardDataResp.size() - 2] == 0x90) {
-        std::cout << "Card Data: ";
-        for (size_t i = 0; i < cardDataResp.size() - 2; i++) {
-            printf("%02X ", cardDataResp[i]);
-        }
-        std::cout << std::endl;
-    }
-
-    // Get Key Info Template
-    std::cout << "\n[3] Getting Key Info Template..." << std::endl;
-    std::vector<unsigned char> getKeyInfo = { 0x00, 0xCA, 0x00, 0xE0, 0x00 };
-    auto keyInfoResp = cardInterface.sendAPDU(getKeyInfo);
-
-    if (keyInfoResp.size() >= 2 && keyInfoResp[keyInfoResp.size() - 2] == 0x90) {
-        std::cout << "Key Info Template: ";
-        for (size_t i = 0; i < keyInfoResp.size() - 2; i++) {
-            printf("%02X ", keyInfoResp[i]);
-        }
-        std::cout << std::endl;
-    }
-
-    // Now let's try a different approach - use the transport key WITH diversification
-    std::cout << "\n==============================================================" << std::endl;
-    std::cout << "?  TESTING KEY DIVERSIFICATION METHODS                      ?" << std::endl;
-    std::cout << "=============================================================\n" << std::endl;
-
-    // If we got CPLC data, try to use it for diversification
-    if (cplcResp.size() >= 14) {
-        std::cout << "\nTrying key diversification with IC Serial Number..." << std::endl;
-
-        unsigned char icSerial[4];
-        memcpy(icSerial, &cplcResp[10], 4);  // IC Serial from CPLC
-
-        std::cout << "IC Serial for diversification: ";
-        for (int i = 0; i < 4; i++) printf("%02X ", icSerial[i]);
-        std::cout << std::endl;
-
-        // Try EMV-style diversification
-        testEMVDiversification(icSerial, 4);
-
-        // Try Gemalto-style diversification  
-        testGemaltoDiversification(cplcResp.data());
-    }
-
-    cardInterface.disconnect();
-    return true;
+    return false;
 }
 
 void SCWriterSCP03::testEMVDiversification(const unsigned char* serial, size_t serialLen) {
