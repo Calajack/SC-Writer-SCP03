@@ -1,7 +1,10 @@
 /*
  * DAT File Parser - Converts CAP files to APDU commands
  * Based on GlobalPlatform CAP file format
+ *
+ * Updated: configurable chunk size and extended-Lc support
  */
+
 #include <algorithm>
 #include <fstream>
 #include <vector>
@@ -9,7 +12,6 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
-#include "sc_writer_scp03.h"
 
 
 struct AppletInfo {
@@ -28,6 +30,8 @@ struct InstallCommand {
 
 class DatFileParser {
 private:
+    size_t maxChunkSize; // configurable chunk size (default 350)
+
     std::vector<unsigned char> hexStringToBytes(const std::string& hex) {
         std::vector<unsigned char> bytes;
         for (size_t i = 0; i < hex.length(); i += 2) {
@@ -37,7 +41,7 @@ private:
         }
         return bytes;
     }
-    
+
     std::string bytesToHexString(const std::vector<unsigned char>& bytes) {
         std::stringstream ss;
         ss << std::hex << std::uppercase;
@@ -46,148 +50,177 @@ private:
         }
         return ss.str();
     }
-    
-    std::vector<InstallCommand> createLoadCommands(const std::vector<unsigned char>& capData, 
-                                                  const AppletInfo& applet) {
+
+    // createLoadCommands now uses the parser's maxChunkSize
+    std::vector<InstallCommand> createLoadCommands(const std::vector<unsigned char>& capData,
+        const AppletInfo& applet) {
         std::vector<InstallCommand> commands;
-        
-        // INSTALL [for load] command
+
+        // INSTALL [for load] command (header)
         InstallCommand loadCmd;
         loadCmd.isLoad = true;
         loadCmd.isInstall = false;
         loadCmd.description = "INSTALL [for load] " + applet.name;
-        
-        // Build INSTALL [for load] APDU
-        std::vector<unsigned char> apdu = {0x80, 0xE6, 0x02, 0x00}; // CLA INS P1 P2
-        
+
+        // Build INSTALL [for load] APDU (header block)
+        std::vector<unsigned char> apdu = { 0x80, 0xE6, 0x02, 0x00 }; // CLA INS P1 P2
+
         // Load file data block
         std::vector<unsigned char> loadBlock;
-        
+
         // Package AID length and AID
         loadBlock.push_back((unsigned char)applet.aidBytes.size());
         loadBlock.insert(loadBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
-        
+
         // Security Domain AID (empty for default)
         loadBlock.push_back(0x00);
-        
+
         // Load file data hash (optional)
         loadBlock.push_back(0x00);
-        
+
         // Load parameters (empty)
         loadBlock.push_back(0x00);
-        
+
         // Load token (empty)
         loadBlock.push_back(0x00);
-        
+
         // Add LC and data
         apdu.push_back((unsigned char)loadBlock.size());
         apdu.insert(apdu.end(), loadBlock.begin(), loadBlock.end());
-        
+
         // Add LE
         apdu.push_back(0x00);
-        
+
         loadCmd.apdu = apdu;
         commands.push_back(loadCmd);
-        
-        // LOAD commands - split CAP data into chunks
-        const size_t MAX_CHUNK_SIZE = 200; // Leave room for APDU overhead
+
+        // LOAD commands - split CAP data into chunks using maxChunkSize
+        // Note: if maxChunkSize > 255 we will emit extended-Lc (0x00 lenHigh lenLow).
         size_t offset = 0;
         int sequenceNumber = 0;
-        
+        const size_t effectiveMax = std::max((size_t)1, maxChunkSize); // avoid zero
+
         while (offset < capData.size()) {
-            size_t chunkSize = (MAX_CHUNK_SIZE < (capData.size() - offset)) ? MAX_CHUNK_SIZE : (capData.size() - offset);
+            size_t remaining = capData.size() - offset;
+            // chunkSize should not exceed remaining nor the configured effectiveMax
+            size_t chunkSize = (effectiveMax < remaining) ? effectiveMax : remaining;
             bool isLast = (offset + chunkSize >= capData.size());
-            
+
             InstallCommand chunk;
             chunk.isLoad = true;
             chunk.isInstall = false;
             chunk.description = "LOAD chunk " + std::to_string(sequenceNumber);
-            
-            // Build LOAD APDU
-            std::vector<unsigned char> loadApdu = {
-                0x80, 0xE8, 
-                isLast ? (unsigned char)0x80 : (unsigned char)0x00,  // P1: last block flag
-                (unsigned char)sequenceNumber,  // P2: sequence number
-                (unsigned char)chunkSize       // LC
-            };
-            
+
+            // Build LOAD APDU header: CLA INS P1 P2
+            std::vector<unsigned char> loadApdu;
+            loadApdu.push_back(0x80);
+            loadApdu.push_back(0xE8);
+            loadApdu.push_back(isLast ? (unsigned char)0x80 : (unsigned char)0x00);  // P1: last block flag
+            loadApdu.push_back((unsigned char)sequenceNumber);  // P2: sequence number
+
+            // Add LC: single-byte or extended
+            if (chunkSize <= 255) {
+                // single-byte Lc
+                loadApdu.push_back((unsigned char)chunkSize);
+            }
+            else {
+                // extended Lc: 0x00 then two-byte length (MSB, LSB)
+                if (chunkSize > 65535) {
+                    std::cerr << "Requested chunkSize too large (>65535): " << chunkSize << ", capping to 65535\n";
+                    chunkSize = 65535;
+                }
+                loadApdu.push_back(0x00); // extended Lc indicator
+                unsigned short len = static_cast<unsigned short>(chunkSize);
+                unsigned char msb = (unsigned char)((len >> 8) & 0xFF);
+                unsigned char lsb = (unsigned char)(len & 0xFF);
+                loadApdu.push_back(msb);
+                loadApdu.push_back(lsb);
+            }
+
             // Add chunk data
-            loadApdu.insert(loadApdu.end(), 
-                           capData.begin() + offset, 
-                           capData.begin() + offset + chunkSize);
-            
+            loadApdu.insert(loadApdu.end(),
+                capData.begin() + offset,
+                capData.begin() + offset + chunkSize);
+
             chunk.apdu = loadApdu;
             commands.push_back(chunk);
-            
+
             offset += chunkSize;
             sequenceNumber++;
         }
-        
+
         return commands;
     }
-    
+
     std::vector<InstallCommand> createInstallCommands(const AppletInfo& applet) {
         std::vector<InstallCommand> commands;
-        
+
         InstallCommand installCmd;
         installCmd.isLoad = false;
         installCmd.isInstall = true;
         installCmd.description = "INSTALL [for install] " + applet.name;
-        
+
         // Build INSTALL [for install] APDU
-        std::vector<unsigned char> apdu = {0x80, 0xE6, 0x0C, 0x00}; // CLA INS P1 P2
-        
+        std::vector<unsigned char> apdu = { 0x80, 0xE6, 0x0C, 0x00 }; // CLA INS P1 P2
+
         std::vector<unsigned char> installBlock;
-        
+
         // Package AID
         installBlock.push_back((unsigned char)applet.aidBytes.size());
         installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
-        
+
         // Module AID (same as package AID for simple applets)
         installBlock.push_back((unsigned char)applet.aidBytes.size());
         installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
-        
+
         // Instance AID (same as module AID)
         installBlock.push_back((unsigned char)applet.aidBytes.size());
         installBlock.insert(installBlock.end(), applet.aidBytes.begin(), applet.aidBytes.end());
-        
+
         // Privileges (default)
         installBlock.push_back(0x01);
         installBlock.push_back(0x00);
-        
+
         // Install parameters (empty)
         installBlock.push_back(0x00);
-        
+
         // Install token (empty)
         installBlock.push_back(0x00);
-        
+
         // Add LC and data
         apdu.push_back((unsigned char)installBlock.size());
         apdu.insert(apdu.end(), installBlock.begin(), installBlock.end());
-        
+
         installCmd.apdu = apdu;
         commands.push_back(installCmd);
-        
+
         return commands;
     }
 
 public:
+    // Constructor allows configurable chunk size (default 350)
+    DatFileParser(size_t maxChunk = 350) : maxChunkSize(maxChunk) {
+        // Keep maxChunk >= 1
+        if (maxChunkSize == 0) maxChunkSize = 350;
+    }
+
+    // parse a single DAT file (or raw CAP data file)
     std::vector<InstallCommand> parseDatFile(const std::string& filename) {
         std::vector<InstallCommand> allCommands;
-        
+
         std::ifstream file(filename, std::ios::binary);
         if (!file.is_open()) {
             std::cerr << "Failed to open DAT file: " << filename << std::endl;
             return allCommands;
         }
-        
+
         // Read entire file
         std::vector<unsigned char> fileData((std::istreambuf_iterator<char>(file)),
-                                           std::istreambuf_iterator<char>());
+            std::istreambuf_iterator<char>());
         file.close();
-        
+
         std::cout << "Parsing DAT file: " << filename << " (" << fileData.size() << " bytes)" << std::endl;
-        
+
         // Parse applet information
         // This is simplified - you may need to adapt based on your exact .dat format
         AppletInfo applet;
@@ -195,33 +228,30 @@ public:
         applet.aid = "A000000001020304";  // Example AID
         applet.aidBytes = hexStringToBytes(applet.aid);
         applet.size = fileData.size();
-        
+
         std::cout << "Found applet: " << applet.name << " (AID: " << applet.aid << ")" << std::endl;
-        
-        // Generate LOAD commands
+
+        // Generate LOAD commands (uses configured maxChunkSize)
         auto loadCommands = createLoadCommands(fileData, applet);
         allCommands.insert(allCommands.end(), loadCommands.begin(), loadCommands.end());
-        
+
         // Generate INSTALL commands  
         auto installCommands = createInstallCommands(applet);
         allCommands.insert(allCommands.end(), installCommands.begin(), installCommands.end());
-        
+
         std::cout << "Generated " << allCommands.size() << " commands from DAT file" << std::endl;
-        
+
         return allCommands;
     }
-    
+
+    // parse a folder of CAP components (calls createLoadCommands for each component)
     std::vector<InstallCommand> parseCapFolder(const std::string& folderPath) {
         std::vector<InstallCommand> allCommands;
-        
-        // Parse all CAP files in the folder
-        // This would scan for .cap files and process each one
-        std::cout << "Parsing CAP folder: " << folderPath << std::endl;
-        
-        // Example: Load cap files from cap/ and cap2/ folders
+
+        // Example file list for components — customize as needed
         std::vector<std::string> capFiles = {
             folderPath + "/Header.cap",
-            folderPath + "/Directory.cap", 
+            folderPath + "/Directory.cap",
             folderPath + "/Applet.cap",
             folderPath + "/Import.cap",
             folderPath + "/ConstantPool.cap",
@@ -232,34 +262,34 @@ public:
             folderPath + "/Export.cap",
             folderPath + "/Descriptor.cap"
         };
-        
+
         for (const auto& capFile : capFiles) {
             std::ifstream file(capFile, std::ios::binary);
             if (file.is_open()) {
                 std::vector<unsigned char> capData((std::istreambuf_iterator<char>(file)),
-                                                  std::istreambuf_iterator<char>());
+                    std::istreambuf_iterator<char>());
                 file.close();
-                
+
                 std::cout << "Loaded CAP component: " << capFile << " (" << capData.size() << " bytes)" << std::endl;
-                
+
                 // Process this CAP component
                 AppletInfo applet;
                 applet.name = "CAP_" + std::to_string(allCommands.size());
                 applet.aid = "A000000001020304";  // You'd extract this from the actual CAP
                 applet.aidBytes = hexStringToBytes(applet.aid);
-                
+
                 auto commands = createLoadCommands(capData, applet);
                 allCommands.insert(allCommands.end(), commands.begin(), commands.end());
             }
         }
-        
+
         return allCommands;
     }
-    
+
     void printCommands(const std::vector<InstallCommand>& commands) {
         std::cout << "\nGenerated Commands:" << std::endl;
         std::cout << "===================" << std::endl;
-        
+
         for (size_t i = 0; i < commands.size(); i++) {
             const auto& cmd = commands[i];
             std::cout << (i + 1) << ". " << cmd.description << std::endl;
