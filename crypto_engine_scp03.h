@@ -34,6 +34,10 @@ private:
     bool performAES_CMAC(const unsigned char* key, const unsigned char* data,
         size_t dataLen, unsigned char* mac);
 
+    bool deriveGemaltoKey(const unsigned char* masterKey, const unsigned char* divData, size_t divDataLen, unsigned char keyType, unsigned char* derivedKey);
+
+    bool tryDirectDiversification(const std::vector<unsigned char>& initUpdateResponse);
+
     bool deriveSessionKey_SCP03(const unsigned char* masterKey, uint8_t keyType,
         const unsigned char* context, size_t contextLen,
         unsigned char* derivedKey);
@@ -52,6 +56,10 @@ private:
         unsigned char* encryptedData);
     bool decryptResponseData(const unsigned char* encryptedData, size_t dataLen,
         unsigned char* plainData);
+    bool deriveKeyFromSerial(const unsigned char* masterKey,
+        const unsigned char* serial,
+        size_t serialLen,
+        unsigned char* derivedKey);
 
     void addISO9797_M2Padding(std::vector<unsigned char>& data);
     void removeISO9797_M2Padding(std::vector<unsigned char>& data);
@@ -65,6 +73,8 @@ public:
     void setHostChallenge(const unsigned char* challenge, size_t length);
 
     int initializeSecureChannel(const std::vector<unsigned char>& initUpdateResponse);
+    bool calculateCryptogramDiagnostic(const unsigned char* key, const unsigned char* hostChallenge, const unsigned char* cardChallenge, const unsigned char* extraData, size_t extraLen, unsigned char* cryptogram, bool isHostCryptogram);
+    bool calculateSCP03Cryptogram(const unsigned char* key, const unsigned char* hostChallenge, const unsigned char* cardChallenge, unsigned char* cryptogram, bool isHostCryptogram);
     std::vector<unsigned char> createExternalAuthenticateCommand(uint8_t securityLevel = 0x03);
 
     std::vector<unsigned char> wrapCommandAPDU(const std::vector<unsigned char>& plainAPDU);
