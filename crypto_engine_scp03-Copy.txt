@@ -384,75 +384,49 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
             0x51, 0x93, 0xE9, 0x81, 0xF5, 0xE8, 0x68, 0x70
         };
 
-        std::vector<std::vector<unsigned char>> additionalKeys = {
-            // Common JCOP keys
-            {0x47, 0x45, 0x4D, 0x58, 0x54, 0x45, 0x53, 0x54,
-             0x4B, 0x45, 0x59, 0x53, 0x4A, 0x43, 0x4F, 0x50}, // GEMXTESTKEYSJCOP
+        // Derive keys using Gemalto method
+        unsigned char derivedEnc[16], derivedMac[16], derivedDek[16];
 
-            {0x47, 0x45, 0x4D, 0x58, 0x54, 0x45, 0x53, 0x54,
-             0x4B, 0x45, 0x59, 0x53, 0x4A, 0x43, 0x4F, 0x50}, // GEMXTESTKEYSJCOP (uppercase)
+        if (deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+            cardDiversificationData.size(), 0x01, derivedEnc) &&
+            deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+                cardDiversificationData.size(), 0x02, derivedMac) &&
+            deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+                cardDiversificationData.size(), 0x03, derivedDek)) {
 
-            {0x67, 0x65, 0x6D, 0x78, 0x74, 0x65, 0x73, 0x74,
-             0x6B, 0x65, 0x79, 0x73, 0x6A, 0x63, 0x6F, 0x70}, // gemxtestkeysjcop (lowercase)
+            std::cout << "Gemalto keys derived successfully" << std::endl;
 
-             // NXP test keys
-             {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
-              0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F},
+            // Try calculating cryptogram with derived MAC key directly
+            unsigned char testCryptogram[8];
+            if (calculateSCP03Cryptogram(derivedMac, state.hostChallenge, state.cardChallenge,
+                testCryptogram, false)) {
+                std::cout << "Gemalto cryptogram (derived MAC): ";
+                for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+                std::cout << std::endl;
 
-              // Zeroized keys
-              {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-               0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-        };
+                if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                    std::cout << "✅ SUCCESS! Using derived MAC key directly" << std::endl;
 
-        std::vector<std::string> additionalKeyNames = {
-            "JCOP Test Key 1", "JCOP Test Key 2", "JCOP Test Key 3",
-            "NXP Default", "All Zeros"
-        };
+                    // Build standard context for session keys
+                    unsigned char context[16];
+                    memcpy(context, state.hostChallenge, 8);
+                    memcpy(context + 8, state.cardChallenge, 8);
 
-        for (size_t keyIdx = 0; keyIdx < additionalKeys.size(); keyIdx++) {
-            std::cout << "\nTesting: " << additionalKeyNames[keyIdx] << std::endl;
+                    // Derive session keys
+                    unsigned char senc[16], smac[16], srmac[16];
+                    if (deriveSessionKey_SCP03(derivedEnc, 0x01, context, 16, senc) &&
+                        deriveSessionKey_SCP03(derivedMac, 0x02, context, 16, smac) &&
+                        deriveSessionKey_SCP03(derivedMac, 0x03, context, 16, srmac)) {
 
-            unsigned char* testKey = additionalKeys[keyIdx].data();
-
-            // Try with Gemalto diversification using this key
-            unsigned char derivedEnc[16], derivedMac[16], derivedDek[16];
-
-            if (deriveGemaltoKey(testKey, cardDiversificationData.data(),
-                cardDiversificationData.size(), 0x01, derivedEnc) &&
-                deriveGemaltoKey(testKey, cardDiversificationData.data(),
-                    cardDiversificationData.size(), 0x02, derivedMac)) {
-
-                // Test cryptogram with derived MAC key
-                unsigned char testCryptogram[8];
-                if (calculateSCP03Cryptogram(derivedMac, state.hostChallenge, state.cardChallenge,
-                    testCryptogram, false)) {
-                    std::cout << "  Cryptogram: ";
-                    for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
-                    std::cout << std::endl;
-
-                    if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
-                        std::cout << "  ✅ MATCH! Found working key: " << additionalKeyNames[keyIdx] << std::endl;
-
-                        // Derive session keys and return success
-                        unsigned char context[16];
-                        memcpy(context, state.hostChallenge, 8);
-                        memcpy(context + 8, state.cardChallenge, 8);
-
-                        unsigned char senc[16], smac[16], srmac[16];
-                        if (deriveSessionKey_SCP03(derivedEnc, 0x01, context, 16, senc) &&
-                            deriveSessionKey_SCP03(derivedMac, 0x02, context, 16, smac) &&
-                            deriveSessionKey_SCP03(derivedMac, 0x03, context, 16, srmac)) {
-
-                            memcpy(state.senc, senc, 16);
-                            memcpy(state.smac, smac, 16);
-                            memcpy(state.srmac, srmac, 16);
-                            memset(state.macChaining, 0, 16);
-                            memset(state.encCounter, 0, 16);
-                            return 0;
-                        }
+                        memcpy(state.senc, senc, 16);
+                        memcpy(state.smac, smac, 16);
+                        memcpy(state.srmac, srmac, 16);
+                        memset(state.macChaining, 0, 16);
+                        memset(state.encCounter, 0, 16);
+                        return 0;
                     }
                 }
-            
+            }
 
             // If direct derived MAC didn't work, try with session keys and different contexts
             std::cout << "\nTrying session keys with different contexts..." << std::endl;
@@ -519,10 +493,10 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
         else {
             std::cout << "❌ Gemalto key derivation failed" << std::endl;
         }
-    
-        else {
-             std::cout << "\n⚠️  No diversification data available, skipping Gemalto method" << std::endl;
-        }
+    }
+    else {
+        std::cout << "\n⚠️  No diversification data available, skipping Gemalto method" << std::endl;
+    }
 
     // === SECOND: TRY DIRECT DIVERSIFICATION ===
     std::cout << "\n=== ATTEMPTING DIRECT DIVERSIFICATION ===" << std::endl;
@@ -531,6 +505,9 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
     }
 
     // === THIRD: FALL BACK TO ORIGINAL STATIC KEY TESTING ===
+    // [KEEP ALL YOUR ORIGINAL STATIC KEY TESTING CODE EXACTLY AS IT WAS]
+    // This ensures no syntax errors from missing code
+
     std::cout << "\n=== FALLING BACK TO STATIC KEY TESTING ===" << std::endl;
 
     // Try multiple master keys
