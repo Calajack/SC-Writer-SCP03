@@ -140,21 +140,23 @@ bool SCWriterSCP03::isDestructiveCommand(const std::vector<unsigned char>& apdu)
     return false;
 }
 
-bool SCWriterSCP03::establishSCP03(uint8_t securityLevel) {
-    std::cout << "\n╔═══════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║  ESTABLISHING SCP03 SECURE CHANNEL (GP 2.2.1)            ║" << std::endl;
-    std::cout << "╚═══════════════════════════════════════════════════════════╝\n" << std::endl;
+bool SCWriterSCP03::establishSCP03(uint8_t securityLevel, bool skipISDSelection) {
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  ESTABLISHING SCP03 SECURE CHANNEL (GP 2.2.1)            ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
 
-    std::cout << "[1/3] Selecting ISD (Card Manager)..." << std::endl;
+    if (!skipISDSelection) {
+        std::cout << "[1/3] Selecting ISD (Card Manager)..." << std::endl;
+    }
     if (dryRunMode) {
-        std::cout << "✅ ISD selected (simulated)" << std::endl;
+        std::cout << "? ISD selected (simulated)" << std::endl;
     }
     else {
         if (!cardInterface.selectISD()) {
-            std::cout << "❌ ISD selection failed" << std::endl;
+            std::cout << "? ISD selection failed" << std::endl;
             return false;
         }
-        std::cout << "✅ ISD selected" << std::endl;
+        std::cout << "? ISD selected" << std::endl;
     }
 
     std::cout << "\n[2/3] Sending INITIALIZE UPDATE..." << std::endl;
@@ -167,14 +169,25 @@ bool SCWriterSCP03::establishSCP03(uint8_t securityLevel) {
     initUpdate.insert(initUpdate.end(), hostChallenge.begin(), hostChallenge.end());
     initUpdate.push_back(0x00);
 
-    auto response = safeSendAPDU(initUpdate);  // This already handles dry-run correctly!
+    auto response = safeSendAPDU(initUpdate);
 
-    if (response.size() < 32 || response[response.size() - 2] != 0x90) {
+    // Check SW first
+    if (response.size() < 2) {
+        std::cout << "❌ INITIALIZE UPDATE failed - no response" << std::endl;
+        return false;
+    }
+
+    if (response[response.size() - 2] != 0x90 || response[response.size() - 1] != 0x00) {
         std::cout << "❌ INITIALIZE UPDATE failed" << std::endl;
-        if (response.size() >= 2) {
-            uint16_t sw = (response[response.size() - 2] << 8) | response[response.size() - 1];
-            std::cout << "   Status: " << std::hex << sw << std::dec << std::endl;
-        }
+        uint16_t sw = (response[response.size() - 2] << 8) | response[response.size() - 1];
+        std::cout << "   Status: " << std::hex << sw << std::dec << std::endl;
+        return false;
+    }
+
+    // Check data length (without SW)
+    size_t dataLen = response.size() - 2;
+    if (dataLen < 28) {
+        std::cout << "❌ INITIALIZE UPDATE response too short: " << dataLen << " bytes (need 28+)" << std::endl;
         return false;
     }
 
@@ -343,13 +356,13 @@ bool SCWriterSCP03::installDATFile(const std::string& filename) {
 }
 
 bool SCWriterSCP03::executePersonalizationScript(const std::string& scriptFile) {
-    std::cout << "\n╔═══════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║  EXECUTING PERSONALIZATION SCRIPT                        ║" << std::endl;
-    std::cout << "╚═══════════════════════════════════════════════════════════╝\n" << std::endl;
+    std::cout << "\n?????????????????????????????????????????????????????????????" << std::endl;
+    std::cout << "?  EXECUTING PERSONALIZATION SCRIPT                        ?" << std::endl;
+    std::cout << "?????????????????????????????????????????????????????????????\n" << std::endl;
 
     std::ifstream file(scriptFile);
     if (!file.is_open()) {
-        std::cout << "❌ Failed to open script file: " << scriptFile << std::endl;
+        std::cout << "? Failed to open script file: " << scriptFile << std::endl;
         return false;
     }
 
@@ -376,7 +389,7 @@ bool SCWriterSCP03::executePersonalizationScript(const std::string& scriptFile) 
         if (apduBytes.size() > 255) {
             std::cout << "Extended APDU (" << apduBytes.size() << " bytes)" << std::endl;
             if (!sendExtendedAPDU(apduBytes, response)) {
-                std::cout << "❌ Extended personalization command " << (i + 1) << " failed" << std::endl;
+                std::cout << "? Extended personalization command " << (i + 1) << " failed" << std::endl;
             }
         }
         else {
@@ -390,12 +403,12 @@ bool SCWriterSCP03::executePersonalizationScript(const std::string& scriptFile) 
             }
 
             if (checkResponse(response, "Personalization command")) {
-                std::cout << "✅ Command executed successfully" << std::endl;
+                std::cout << "? Command executed successfully" << std::endl;
             }
         }
     }
 
-    std::cout << "\n✅ Personalization script completed" << std::endl;
+    std::cout << "\n? Personalization script completed" << std::endl;
     return true;
 }
 
@@ -434,7 +447,7 @@ bool SCWriterSCP03::writeCard(const std::string& datFile) {
     for (auto byte : atr) printf("%02X ", byte);
     std::cout << std::endl;
 
-    if (!establishSCP03(0x03)) {
+    if (!establishSCP03(0x03, false)) {
         std::cout << "? Failed to establish SCP03 secure channel" << std::endl;
         return false;
     }
@@ -486,6 +499,61 @@ bool SCWriterSCP03::probeCard() {
     for (auto byte : atr) printf("%02X ", byte);
     std::cout << std::endl;
 
+    std::vector<unsigned char> getData = { 0x80, 0xCA, 0x00, 0x66, 0x00 };  // GET DATA
+    auto response = cardInterface.sendAPDU(getData);
+    std::cout << "Card Data: ";
+    for (auto b : response) printf("%02X ", b);
+    std::cout << std::endl;
+    std::cout << "\n=== QUERYING CARD INFORMATION ===" << std::endl;
+
+    // 1. Get Card Data (different tags)
+    std::vector<std::vector<unsigned char>> getDataCommands = {
+        {0x80, 0xCA, 0x00, 0x66, 0x00},  // Card Data
+        {0x80, 0xCA, 0x00, 0x6E, 0x00},  // Secure Channel Info
+        {0x80, 0xCA, 0x00, 0x45, 0x00},  // CPLC data (card production data)
+        {0x80, 0xCA, 0x00, 0xC1, 0x00},  // Sequence Counter
+        {0x80, 0xCA, 0x9F, 0x7F, 0x00},  // CPLC (alternate)
+        {0x80, 0xCA, 0x00, 0x42, 0x00},  // ISD AID
+        {0x80, 0xCA, 0x00, 0xE0, 0x00},  // Key Info Template
+    };
+
+    std::vector<std::string> descriptions = {
+        "Card Data",
+        "Secure Channel Info",
+        "CPLC Data",
+        "Sequence Counter",
+        "CPLC (Alt)",
+        "ISD AID",
+        "Key Info Template"
+    };
+
+    for (size_t i = 0; i < getDataCommands.size(); i++) {
+        std::cout << "\nTrying: " << descriptions[i] << std::endl;
+        auto resp = cardInterface.sendAPDU(getDataCommands[i]);
+
+        if (resp.size() >= 2) {
+            uint16_t sw = (resp[resp.size() - 2] << 8) | resp[resp.size() - 1];
+            if (sw == 0x9000) {
+                std::cout << "✅ SUCCESS: ";
+                for (size_t j = 0; j < resp.size() - 2; j++) {
+                    printf("%02X ", resp[j]);
+                }
+                std::cout << std::endl;
+            }
+            else {
+                std::cout << "❌ Failed: " << std::hex << sw << std::dec << std::endl;
+            }
+        }
+    }
+
+    // 2. Get Registry (list all AIDs on card)
+    std::cout << "\n=== GET REGISTRY (List all applications) ===" << std::endl;
+    std::vector<unsigned char> getRegistry = { 0x80, 0xF2, 0x40, 0x00, 0x02, 0x4F, 0x00, 0x00 };
+    auto regResp = cardInterface.sendAPDU(getRegistry);
+    std::cout << "Registry Response: ";
+    for (auto b : regResp) printf("%02X ", b);
+    std::cout << std::endl;
+
     std::cout << "Reader: " << cardInterface.getReaderName() << std::endl;
     std::cout << "Card present: " << (cardInterface.isCardPresent() ? "Yes" : "No") << std::endl;
 
@@ -518,7 +586,7 @@ bool SCWriterSCP03::testSCP03Handshake() {
     for (auto byte : atr) printf("%02X ", byte);
     std::cout << std::endl;
 
-    bool result = establishSCP03(0x03);
+    bool result = establishSCP03(0x03, false);
 
     if (result) {
         std::cout << "\n? SCP03 handshake test PASSED" << std::endl;
@@ -543,7 +611,7 @@ bool SCWriterSCP03::testExtendedAPDU() {
         return false;
     }
 
-    if (!establishSCP03(0x03)) {
+    if (!establishSCP03(0x03, false)) {
         std::cout << "? Failed to establish SCP03" << std::endl;
         cardInterface.disconnect();
         return false;
@@ -595,7 +663,7 @@ bool SCWriterSCP03::testCompleteWorkflow() {
     std::cout << "? ISD selected" << std::endl;
 
     std::cout << "\n[3/5] Testing SCP03 establishment..." << std::endl;
-    if (!establishSCP03(0x03)) {
+    if (!establishSCP03(0x03, true)) {  // true = skip ISD selection
         std::cout << "? Failed" << std::endl;
         cardInterface.disconnect();
         return false;
@@ -627,6 +695,199 @@ bool SCWriterSCP03::testCompleteWorkflow() {
     std::cout << "?????????????????????????????????????????????????????????????" << std::endl;
 
     cardInterface.disconnect();
+    return true;
+}
+
+bool SCWriterSCP03::getCardInformation() {
+    std::cout << "\n==============================================================" << std::endl;
+    std::cout << "?  GETTING CARD INFORMATION FOR DIVERSIFICATION ANALYSIS    ?" << std::endl;
+    std::cout << "=============================================================\n" << std::endl;
+
+    if (!cardInterface.connectToCard()) {
+        std::cout << "? Failed to connect to card" << std::endl;
+        return false;
+    }
+
+    // First, let's get CPLC data (Card Production Life Cycle)
+    std::cout << "\n[1] Getting CPLC Data (Card Production Life Cycle)..." << std::endl;
+    std::cout << "This contains the card serial number used for diversification" << std::endl;
+
+    std::vector<unsigned char> getCPLC = { 0x80, 0xCA, 0x9F, 0x7F, 0x00 };
+    auto cplcResp = cardInterface.sendAPDU(getCPLC);
+
+    if (cplcResp.size() >= 2 && cplcResp[cplcResp.size() - 2] == 0x90) {
+        std::cout << "CPLC Data: ";
+        for (size_t i = 0; i < cplcResp.size() - 2; i++) {
+            printf("%02X ", cplcResp[i]);
+        }
+        std::cout << std::endl;
+
+        if (cplcResp.size() >= 42) {  // Standard CPLC is 42 bytes
+            std::cout << "\nCPLC Breakdown:" << std::endl;
+            std::cout << "  IC Fabricator: ";
+            for (int i = 0; i < 2; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+
+            std::cout << "  IC Type: ";
+            for (int i = 2; i < 4; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+
+            std::cout << "  OS ID: ";
+            for (int i = 4; i < 6; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+
+            std::cout << "  OS Release Date: ";
+            for (int i = 6; i < 8; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+
+            std::cout << "  OS Release Level: ";
+            for (int i = 8; i < 10; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+
+            std::cout << "  IC Serial Number: ";
+            for (int i = 10; i < 14; i++) printf("%02X ", cplcResp[i]);
+            std::cout << " <- Often used for diversification!" << std::endl;
+
+            std::cout << "  IC Batch ID: ";
+            for (int i = 14; i < 16; i++) printf("%02X ", cplcResp[i]);
+            std::cout << std::endl;
+        }
+    }
+    else {
+        std::cout << "Failed to get CPLC data" << std::endl;
+    }
+
+    // Get Card Data
+    std::cout << "\n[2] Getting Card Data..." << std::endl;
+    std::vector<unsigned char> getCardData = { 0x00, 0xCA, 0x00, 0x66, 0x00 };
+    auto cardDataResp = cardInterface.sendAPDU(getCardData);
+
+    if (cardDataResp.size() >= 2 && cardDataResp[cardDataResp.size() - 2] == 0x90) {
+        std::cout << "Card Data: ";
+        for (size_t i = 0; i < cardDataResp.size() - 2; i++) {
+            printf("%02X ", cardDataResp[i]);
+        }
+        std::cout << std::endl;
+    }
+
+    // Get Key Info Template
+    std::cout << "\n[3] Getting Key Info Template..." << std::endl;
+    std::vector<unsigned char> getKeyInfo = { 0x00, 0xCA, 0x00, 0xE0, 0x00 };
+    auto keyInfoResp = cardInterface.sendAPDU(getKeyInfo);
+
+    if (keyInfoResp.size() >= 2 && keyInfoResp[keyInfoResp.size() - 2] == 0x90) {
+        std::cout << "Key Info Template: ";
+        for (size_t i = 0; i < keyInfoResp.size() - 2; i++) {
+            printf("%02X ", keyInfoResp[i]);
+        }
+        std::cout << std::endl;
+    }
+
+    // Now let's try a different approach - use the transport key WITH diversification
+    std::cout << "\n==============================================================" << std::endl;
+    std::cout << "?  TESTING KEY DIVERSIFICATION METHODS                      ?" << std::endl;
+    std::cout << "=============================================================\n" << std::endl;
+
+    // If we got CPLC data, try to use it for diversification
+    if (cplcResp.size() >= 14) {
+        std::cout << "\nTrying key diversification with IC Serial Number..." << std::endl;
+
+        unsigned char icSerial[4];
+        memcpy(icSerial, &cplcResp[10], 4);  // IC Serial from CPLC
+
+        std::cout << "IC Serial for diversification: ";
+        for (int i = 0; i < 4; i++) printf("%02X ", icSerial[i]);
+        std::cout << std::endl;
+
+        // Try EMV-style diversification
+        testEMVDiversification(icSerial, 4);
+
+        // Try Gemalto-style diversification  
+        testGemaltoDiversification(cplcResp.data());
+    }
+
+    cardInterface.disconnect();
+    return true;
+}
+
+void SCWriterSCP03::testEMVDiversification(const unsigned char* serial, size_t serialLen) {
+    std::cout << "\n[EMV-Style Diversification Test]" << std::endl;
+
+    unsigned char transportKey[16] = {
+        0x1D, 0xDC, 0xD7, 0xAD, 0xBB, 0x1B, 0x5C, 0xDA,
+        0x51, 0x93, 0xE9, 0x81, 0xF5, 0xE8, 0x68, 0x70
+    };
+
+    // Build diversification data (16 bytes)
+    unsigned char divData[16];
+    memset(divData, 0xFF, 16);  // Fill with FF
+    memcpy(divData, serial, (serialLen < 16) ? serialLen : 16);
+
+    std::cout << "Diversification data: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", divData[i]);
+    std::cout << std::endl;
+
+    // Method 1: Encrypt diversification data with transport key
+    unsigned char diversifiedKey1[16];
+    // You'll need to call AES ECB encrypt here
+    // performAES_ECB_Encrypt(transportKey, divData, diversifiedKey1, 16);
+
+    std::cout << "Method 1 - Diversified key: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", diversifiedKey1[i]);
+    std::cout << std::endl;
+
+    // Method 2: XOR then encrypt
+    unsigned char divData2[16];
+    for (int i = 0; i < 16; i++) {
+        divData2[i] = divData[i] ^ 0x55;  // Common XOR pattern
+    }
+
+    unsigned char diversifiedKey2[16];
+    // performAES_ECB_Encrypt(transportKey, divData2, diversifiedKey2, 16);
+
+    std::cout << "Method 2 - Diversified key: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", diversifiedKey2[i]);
+    std::cout << std::endl;
+}
+
+void SCWriterSCP03::testGemaltoDiversification(const unsigned char* cplcData) {
+    std::cout << "\n[Gemalto/Thales-Style Diversification Test]" << std::endl;
+
+    // Gemalto often uses specific bytes from CPLC
+    // Common patterns:
+    // - Use IC Serial (4 bytes) + IC Batch (2 bytes) + padding
+    // - Use entire CPLC subset
+
+    unsigned char divInput[16];
+    memset(divInput, 0x00, 16);
+
+    // Pattern 1: IC Serial + Batch
+    memcpy(divInput, &cplcData[10], 4);  // IC Serial
+    memcpy(divInput + 4, &cplcData[14], 2);  // IC Batch
+
+    std::cout << "Gemalto div pattern 1: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", divInput[i]);
+    std::cout << std::endl;
+
+    // Calculate diversified key using CMAC-based KDF
+    // This is often used by Gemalto
+    std::cout << "Would derive key using CMAC-KDF with this input..." << std::endl;
+}
+
+// Add this to your main test function or create a new test
+bool SCWriterSCP03::testWithDiversification() {
+    std::cout << "\n==============================================================" << std::endl;
+    std::cout << "?  COMPREHENSIVE DIVERSIFICATION TEST                        ?" << std::endl;
+    std::cout << "=============================================================\n" << std::endl;
+
+    // First get card information
+    if (!getCardInformation()) {
+        return false;
+    }
+
+    // Now try INITIALIZE UPDATE with the knowledge we gained
+    // ... continue with your normal flow but with diversified keys
+
     return true;
 }
 
