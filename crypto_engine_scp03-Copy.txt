@@ -154,34 +154,32 @@ bool SmartCardCryptoSCP03::deriveGemaltoKey(const unsigned char* masterKey,
     size_t divDataLen,
     unsigned char keyType,
     unsigned char* derivedKey) {
-    std::cout << "\n[Gemalto Key Diversification]" << std::endl;
+    std::cout << "\n[Gemalto Key Diversification - FIXED]" << std::endl;
 
-    // Gemalto typically uses a CMAC-based KDF for SCP03
-    // The input format is often:
-    // Label || 0x00 || divData || keyType
+    // Correct KDF input per GlobalPlatform SCP03 spec:
+    // Label || 0x00 || Context || L || i
 
     std::vector<unsigned char> kdfInput;
 
-    // Label for key diversification (11 bytes)
-    const unsigned char label[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                     0x00, 0x00, 0x00, 0x00, 0x01 };
+    // Label based on key type (11 bytes)
+    unsigned char label[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0x00, 0x00, 0x00, 0x00, 0x00 };
+    label[10] = keyType;  // 0x01 for ENC, 0x02 for MAC, 0x03 for DEK
+
     kdfInput.insert(kdfInput.end(), label, label + 11);
 
     // Separator
     kdfInput.push_back(0x00);
 
-    // Length
-    kdfInput.push_back(0x00);
-    kdfInput.push_back(0x80);  // 128 bits
-
-    // Counter
-    kdfInput.push_back(0x01);
-
-    // Diversification data (from INIT UPDATE response bytes 0-9)
+    // Context - use the diversification data
     kdfInput.insert(kdfInput.end(), divData, divData + divDataLen);
 
-    // Key type identifier
-    kdfInput.push_back(keyType);  // 0x01 for ENC, 0x02 for MAC, 0x03 for DEK
+    // Length (L) - 128 bits = 0x0080
+    kdfInput.push_back(0x00);
+    kdfInput.push_back(0x80);
+
+    // Counter (i) - always 0x01 for single block
+    kdfInput.push_back(0x01);
 
     std::cout << "KDF Input: ";
     for (auto b : kdfInput) printf("%02X ", b);
@@ -190,6 +188,7 @@ bool SmartCardCryptoSCP03::deriveGemaltoKey(const unsigned char* masterKey,
     // Calculate CMAC
     unsigned char mac[16];
     if (!performAES_CMAC(masterKey, kdfInput.data(), kdfInput.size(), mac)) {
+        std::cout << "CMAC calculation failed" << std::endl;
         return false;
     }
 
@@ -317,6 +316,18 @@ bool SmartCardCryptoSCP03::deriveSessionKey_SCP03(const unsigned char* masterKey
     return true;
 }
 
+void SmartCardCryptoSCP03::setDiversificationData(const std::vector<unsigned char>& data) {
+    cardDiversificationData = data;
+    std::cout << "Diversification data set (" << data.size() << " bytes): ";
+    for (auto b : data) printf("%02X ", b);
+    std::cout << std::endl;
+}
+
+void SmartCardCryptoSCP03::setInitUpdateResponse(const std::vector<unsigned char>& response) {
+    initUpdateResponse = response;
+    std::cout << "INIT UPDATE response stored (" << response.size() << " bytes)" << std::endl;
+}
+
 bool SmartCardCryptoSCP03::deriveKeyFromSerial(const unsigned char* masterKey,
     const unsigned char* serial,
     size_t serialLen,
@@ -344,7 +355,7 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
 
     std::cout << "\n=== SCP03 DIAGNOSTIC MODE ===" << std::endl;
 
-    // Parse the response (this part is now correct)
+    // Parse the response
     memcpy(state.cardChallenge, &initUpdateResponse[13], 8);    // bytes 13-20
     memcpy(state.cardCryptogram, &initUpdateResponse[21], 8);   // bytes 21-28
     memcpy(state.sequenceCounter, &initUpdateResponse[29], 3);  // bytes 29-31
@@ -360,6 +371,81 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
     std::cout << "Sequence Counter: ";
     for (int i = 0; i < 3; i++) printf("%02X ", state.sequenceCounter[i]);
     std::cout << std::endl;
+
+    // === FIRST: TRY GEMALTO DIVERSIFICATION WITH IC SERIAL ===
+    if (!cardDiversificationData.empty()) {
+        std::cout << "\n=== ATTEMPTING GEMALTO DIVERSIFICATION ===" << std::endl;
+        std::cout << "Using IC Serial: ";
+        for (auto b : cardDiversificationData) printf("%02X ", b);
+        std::cout << std::endl;
+
+        unsigned char transportKey[16] = {
+            0x1D, 0xDC, 0xD7, 0xAD, 0xBB, 0x1B, 0x5C, 0xDA,
+            0x51, 0x93, 0xE9, 0x81, 0xF5, 0xE8, 0x68, 0x70
+        };
+
+        // Derive keys using Gemalto method
+        unsigned char derivedEnc[16], derivedMac[16], derivedDek[16];
+
+        if (deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+            cardDiversificationData.size(), 0x01, derivedEnc) &&
+            deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+                cardDiversificationData.size(), 0x02, derivedMac) &&
+            deriveGemaltoKey(transportKey, cardDiversificationData.data(),
+                cardDiversificationData.size(), 0x03, derivedDek)) {
+
+            std::cout << "Gemalto keys derived successfully" << std::endl;
+
+            // Build context for session key derivation
+            unsigned char context[16];
+            memcpy(context, state.hostChallenge, 8);
+            memcpy(context + 8, state.cardChallenge, 8);
+
+            // Derive session keys
+            unsigned char senc[16], smac[16], srmac[16];
+            if (deriveSessionKey_SCP03(derivedEnc, 0x01, context, 16, senc) &&
+                deriveSessionKey_SCP03(derivedMac, 0x02, context, 16, smac) &&
+                deriveSessionKey_SCP03(derivedMac, 0x03, context, 16, srmac)) {
+
+                // Test the card cryptogram
+                unsigned char testCryptogram[8];
+                if (calculateSCP03Cryptogram(smac, state.hostChallenge, state.cardChallenge,
+                    testCryptogram, false)) {
+                    std::cout << "Gemalto test cryptogram: ";
+                    for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+                    std::cout << std::endl;
+
+                    if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                        std::cout << "✅ SUCCESS! Gemalto diversification works!" << std::endl;
+                        memcpy(state.senc, senc, 16);
+                        memcpy(state.smac, smac, 16);
+                        memcpy(state.srmac, srmac, 16);
+                        memset(state.macChaining, 0, 16);
+                        memset(state.encCounter, 0, 16);
+                        return 0;
+                    }
+                    else {
+                        std::cout << "❌ Gemalto cryptogram doesn't match" << std::endl;
+                    }
+                }
+            }
+        }
+        else {
+            std::cout << "❌ Gemalto key derivation failed" << std::endl;
+        }
+    }
+    else {
+        std::cout << "\n⚠️  No diversification data available, skipping Gemalto method" << std::endl;
+    }
+
+    // === SECOND: TRY DIRECT DIVERSIFICATION ===
+    std::cout << "\n=== ATTEMPTING DIRECT DIVERSIFICATION ===" << std::endl;
+    if (tryDirectDiversification(initUpdateResponse)) {
+        return 0;
+    }
+
+    // === THIRD: FALL BACK TO ORIGINAL STATIC KEY TESTING ===
+    std::cout << "\n=== FALLING BACK TO STATIC KEY TESTING ===" << std::endl;
 
     // Try multiple master keys
     std::vector<std::vector<unsigned char>> testKeys = {
@@ -418,44 +504,36 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
         contexts.push_back(ctx3);
         contextNames.push_back("Sequence First (seq||host||card)");
 
+        // Try each context with Gemalto-derived keys
         for (size_t ctxIdx = 0; ctxIdx < contexts.size(); ctxIdx++) {
-            std::cout << "\n  Testing context: " << contextNames[ctxIdx] << std::endl;
+            std::cout << "  Testing context: " << contextNames[ctxIdx] << std::endl;
 
-            // Derive session keys
+            // Derive session keys with this context
             unsigned char senc[16], smac[16], srmac[16];
+            if (deriveSessionKey_SCP03(derivedEnc, 0x01, contexts[ctxIdx].data(), contexts[ctxIdx].size(), senc) &&
+                deriveSessionKey_SCP03(derivedMac, 0x02, contexts[ctxIdx].data(), contexts[ctxIdx].size(), smac) &&
+                deriveSessionKey_SCP03(derivedMac, 0x03, contexts[ctxIdx].data(), contexts[ctxIdx].size(), srmac)) {
 
-            if (!deriveSessionKey_SCP03(masterKey, 0x01, contexts[ctxIdx].data(), contexts[ctxIdx].size(), senc)) {
-                continue;
-            }
-            if (!deriveSessionKey_SCP03(masterKey, 0x02, contexts[ctxIdx].data(), contexts[ctxIdx].size(), smac)) {
-                continue;
-            }
-            if (!deriveSessionKey_SCP03(masterKey, 0x03, contexts[ctxIdx].data(), contexts[ctxIdx].size(), srmac)) {
-                continue;
-            }
-
-            // Now try different cryptogram calculation methods
-            unsigned char testCryptogram[8];
-
-            // Method 1: Standard context for cryptogram
-            if (calculateCryptogramDiagnostic(smac, state.hostChallenge, state.cardChallenge,
-                NULL, 0, testCryptogram, false)) {
-                std::cout << "    Method 1 (standard): ";
-                for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
-
-                if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
-                    std::cout << " <- MATCH!" << std::endl;
-                    foundMatch = true;
-                    memcpy(workingKey, masterKey, 16);
-                    memcpy(state.senc, senc, 16);
-                    memcpy(state.smac, smac, 16);
-                    memcpy(state.srmac, srmac, 16);
-                    break;
-                }
-                else {
+                // Test the card cryptogram
+                unsigned char testCryptogram[8];
+                if (calculateSCP03Cryptogram(smac, state.hostChallenge, state.cardChallenge,
+                    testCryptogram, false)) {
+                    std::cout << "    Gemalto cryptogram: ";
+                    for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
                     std::cout << std::endl;
+
+                    if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                        std::cout << "    ✅ MATCH! Using context: " << contextNames[ctxIdx] << std::endl;
+                        memcpy(state.senc, senc, 16);
+                        memcpy(state.smac, smac, 16);
+                        memcpy(state.srmac, srmac, 16);
+                        memset(state.macChaining, 0, 16);
+                        memset(state.encCounter, 0, 16);
+                        return 0;
+                    }
                 }
             }
+        
 
             // Method 2: With sequence counter in cryptogram context
             if (calculateCryptogramDiagnostic(smac, state.hostChallenge, state.cardChallenge,
