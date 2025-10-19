@@ -108,33 +108,173 @@ bool SmartCardCryptoSCP03::performAES_CMAC(const unsigned char* key,
     const unsigned char* data,
     size_t dataLen,
     unsigned char* mac) {
-    CMAC_CTX* ctx = CMAC_CTX_new();
+    EVP_MAC* cmac = EVP_MAC_fetch(NULL, "CMAC", NULL);
+    if (!cmac) {
+        std::cerr << "Failed to fetch CMAC algorithm" << std::endl;
+        return false;
+    }
+
+    EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(cmac);
+    EVP_MAC_free(cmac);
+
     if (!ctx) {
         std::cerr << "Failed to create CMAC context" << std::endl;
         return false;
     }
 
-    if (!CMAC_Init(ctx, key, 16, EVP_aes_128_cbc(), NULL)) {
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string("cipher", (char*)"AES-128-CBC", 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (!EVP_MAC_init(ctx, key, 16, params)) {
         std::cerr << "Failed to initialize CMAC" << std::endl;
-        CMAC_CTX_free(ctx);
+        EVP_MAC_CTX_free(ctx);
         return false;
     }
 
-    if (!CMAC_Update(ctx, data, dataLen)) {
+    if (!EVP_MAC_update(ctx, data, dataLen)) {
         std::cerr << "Failed to update CMAC" << std::endl;
-        CMAC_CTX_free(ctx);
+        EVP_MAC_CTX_free(ctx);
         return false;
     }
 
     size_t macLen = 16;
-    if (!CMAC_Final(ctx, mac, &macLen)) {
+    if (!EVP_MAC_final(ctx, mac, &macLen, 16)) {
         std::cerr << "Failed to finalize CMAC" << std::endl;
-        CMAC_CTX_free(ctx);
+        EVP_MAC_CTX_free(ctx);
         return false;
     }
 
-    CMAC_CTX_free(ctx);
+    EVP_MAC_CTX_free(ctx);
+    return (macLen == 16);
+}
+
+bool SmartCardCryptoSCP03::deriveGemaltoKey(const unsigned char* masterKey,
+    const unsigned char* divData,
+    size_t divDataLen,
+    unsigned char keyType,
+    unsigned char* derivedKey) {
+    std::cout << "\n[Gemalto Key Diversification]" << std::endl;
+
+    // Gemalto typically uses a CMAC-based KDF for SCP03
+    // The input format is often:
+    // Label || 0x00 || divData || keyType
+
+    std::vector<unsigned char> kdfInput;
+
+    // Label for key diversification (11 bytes)
+    const unsigned char label[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                     0x00, 0x00, 0x00, 0x00, 0x01 };
+    kdfInput.insert(kdfInput.end(), label, label + 11);
+
+    // Separator
+    kdfInput.push_back(0x00);
+
+    // Length
+    kdfInput.push_back(0x00);
+    kdfInput.push_back(0x80);  // 128 bits
+
+    // Counter
+    kdfInput.push_back(0x01);
+
+    // Diversification data (from INIT UPDATE response bytes 0-9)
+    kdfInput.insert(kdfInput.end(), divData, divData + divDataLen);
+
+    // Key type identifier
+    kdfInput.push_back(keyType);  // 0x01 for ENC, 0x02 for MAC, 0x03 for DEK
+
+    std::cout << "KDF Input: ";
+    for (auto b : kdfInput) printf("%02X ", b);
+    std::cout << std::endl;
+
+    // Calculate CMAC
+    unsigned char mac[16];
+    if (!performAES_CMAC(masterKey, kdfInput.data(), kdfInput.size(), mac)) {
+        return false;
+    }
+
+    memcpy(derivedKey, mac, 16);
+
+    std::cout << "Derived Key: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", derivedKey[i]);
+    std::cout << std::endl;
+
     return true;
+}
+
+// Alternative: Try the diversification data from INIT UPDATE directly
+bool SmartCardCryptoSCP03::tryDirectDiversification(const std::vector<unsigned char>& initUpdateResponse) {
+    std::cout << "\n=== TRYING DIRECT DIVERSIFICATION ===" << std::endl;
+
+    // The first 10 bytes might not be zeros but actual diversification data
+    // that we need to use to derive the card-specific keys
+
+    unsigned char divData[10];
+    memcpy(divData, initUpdateResponse.data(), 10);
+
+    // Even though they look like zeros, they might be meaningful
+    std::cout << "Diversification Data from card: ";
+    for (int i = 0; i < 10; i++) printf("%02X ", divData[i]);
+    std::cout << std::endl;
+
+    unsigned char transportKey[16] = {
+        0x1D, 0xDC, 0xD7, 0xAD, 0xBB, 0x1B, 0x5C, 0xDA,
+        0x51, 0x93, 0xE9, 0x81, 0xF5, 0xE8, 0x68, 0x70
+    };
+
+    // Method 1: Use AES ECB encryption for diversification
+    unsigned char divInput[16];
+    memset(divInput, 0, 16);
+    memcpy(divInput, divData, 10);
+
+    // Add key type indicators
+    unsigned char keyEnc[16], keyMac[16], keyDek[16];
+
+    // For Key-ENC
+    divInput[15] = 0x01;
+    performAES_ECB_Encrypt(transportKey, divInput, keyEnc, 16);
+
+    // For Key-MAC  
+    divInput[15] = 0x02;
+    performAES_ECB_Encrypt(transportKey, divInput, keyMac, 16);
+
+    // For Key-DEK
+    divInput[15] = 0x03;
+    performAES_ECB_Encrypt(transportKey, divInput, keyDek, 16);
+
+    std::cout << "Diversified Key-ENC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", keyEnc[i]);
+    std::cout << std::endl;
+
+    std::cout << "Diversified Key-MAC: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", keyMac[i]);
+    std::cout << std::endl;
+
+    // Now use these diversified keys for session key derivation
+    unsigned char context[16];
+    memcpy(context, state.hostChallenge, 8);
+    memcpy(context + 8, state.cardChallenge, 8);
+
+    // Derive session keys with diversified master keys
+    deriveSessionKey_SCP03(keyEnc, 0x01, context, 16, state.senc);
+    deriveSessionKey_SCP03(keyMac, 0x02, context, 16, state.smac);
+    deriveSessionKey_SCP03(keyMac, 0x03, context, 16, state.srmac);
+
+    // Test card cryptogram with these keys
+    unsigned char testCryptogram[8];
+    calculateSCP03Cryptogram(state.smac, state.hostChallenge,
+        state.cardChallenge, testCryptogram, false);
+
+    std::cout << "Test Cryptogram: ";
+    for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+    std::cout << std::endl;
+
+    if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+        std::cout << "SUCCESS! Diversification method found!" << std::endl;
+        return true;
+    }
+
+    return false;
 }
 
 bool SmartCardCryptoSCP03::deriveSessionKey_SCP03(const unsigned char* masterKey,
@@ -177,23 +317,37 @@ bool SmartCardCryptoSCP03::deriveSessionKey_SCP03(const unsigned char* masterKey
     return true;
 }
 
+bool SmartCardCryptoSCP03::deriveKeyFromSerial(const unsigned char* masterKey,
+    const unsigned char* serial,
+    size_t serialLen,
+    unsigned char* derivedKey) {
+    // EMV-style diversification: Encrypt(MasterKey, Serial || F-Padding)
+    unsigned char diversificationData[16];
+
+    // Copy serial number
+    memcpy(diversificationData, serial, (serialLen < 16) ? serialLen : 16);
+
+    // Pad with 0xFF if serial is shorter than 16 bytes
+    for (size_t i = serialLen; i < 16; i++) {
+        diversificationData[i] = 0xFF;
+    }
+
+    // Encrypt with master key
+    return performAES_ECB_Encrypt(masterKey, diversificationData, derivedKey, 16);
+}
+
 int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned char>& initUpdateResponse) {
-    if (initUpdateResponse.size() < 32) {
-        std::cerr << "INIT UPDATE response too short for SCP03 (need 32 bytes)" << std::endl;
+    if (initUpdateResponse.size() < 28) {
+        std::cerr << "INIT UPDATE response too short for SCP03 (need at least 28 bytes)" << std::endl;
         return -1;
     }
 
-    std::cout << "\n=== SCP03 INITIALIZE SECURE CHANNEL ===" << std::endl;
+    std::cout << "\n=== SCP03 DIAGNOSTIC MODE ===" << std::endl;
 
-    memcpy(state.initUpdateResponse, initUpdateResponse.data(), 32);
-
-    memcpy(state.sequenceCounter, &initUpdateResponse[12], 3);
-    memcpy(state.cardChallenge, &initUpdateResponse[13], 8);
-    memcpy(state.cardCryptogram, &initUpdateResponse[21], 8);
-
-    std::cout << "Sequence Counter: ";
-    for (int i = 0; i < 3; i++) printf("%02X ", state.sequenceCounter[i]);
-    std::cout << std::endl;
+    // Parse the response (this part is now correct)
+    memcpy(state.cardChallenge, &initUpdateResponse[13], 8);    // bytes 13-20
+    memcpy(state.cardCryptogram, &initUpdateResponse[21], 8);   // bytes 21-28
+    memcpy(state.sequenceCounter, &initUpdateResponse[29], 3);  // bytes 29-31
 
     std::cout << "Card Challenge: ";
     for (int i = 0; i < 8; i++) printf("%02X ", state.cardChallenge[i]);
@@ -203,58 +357,213 @@ int SmartCardCryptoSCP03::initializeSecureChannel(const std::vector<unsigned cha
     for (int i = 0; i < 8; i++) printf("%02X ", state.cardCryptogram[i]);
     std::cout << std::endl;
 
-    unsigned char context[16];
-    memcpy(context, state.hostChallenge, 8);
-    memcpy(context + 8, state.cardChallenge, 8);
+    std::cout << "Sequence Counter: ";
+    for (int i = 0; i < 3; i++) printf("%02X ", state.sequenceCounter[i]);
+    std::cout << std::endl;
 
-    unsigned char masterKey[16] = {
-        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
-        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F
+    // Try multiple master keys
+    std::vector<std::vector<unsigned char>> testKeys = {
+        // Your current key
+        {0x1D, 0xDC, 0xD7, 0xAD, 0xBB, 0x1B, 0x5C, 0xDA,
+         0x51, 0x93, 0xE9, 0x81, 0xF5, 0xE8, 0x68, 0x70},
+
+         // Common default keys
+         {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+          0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F},
+
+         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+
+          // Another common test key
+          {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+           0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
     };
 
-    std::cout << "\nDeriving session keys..." << std::endl;
+    std::vector<std::string> keyNames = {
+        "Transport Key", "JCOP Default", "All Zeros", "All FFs"
+    };
 
-    if (!deriveSessionKey_SCP03(masterKey, 0x01, context, 16, state.senc)) {
-        std::cerr << "Failed to derive S-ENC" << std::endl;
+    bool foundMatch = false;
+    unsigned char workingKey[16];
+
+    for (size_t keyIdx = 0; keyIdx < testKeys.size(); keyIdx++) {
+        std::cout << "\n=== Testing Key #" << (keyIdx + 1) << ": " << keyNames[keyIdx] << " ===" << std::endl;
+
+        unsigned char* masterKey = testKeys[keyIdx].data();
+
+        // Try different context variations
+        std::vector<std::vector<unsigned char>> contexts;
+        std::vector<std::string> contextNames;
+
+        // Context 1: Standard (host || card)
+        std::vector<unsigned char> ctx1(16);
+        memcpy(ctx1.data(), state.hostChallenge, 8);
+        memcpy(ctx1.data() + 8, state.cardChallenge, 8);
+        contexts.push_back(ctx1);
+        contextNames.push_back("Standard (host||card)");
+
+        // Context 2: With sequence counter (host || card || seq)
+        std::vector<unsigned char> ctx2(19);
+        memcpy(ctx2.data(), state.hostChallenge, 8);
+        memcpy(ctx2.data() + 8, state.cardChallenge, 8);
+        memcpy(ctx2.data() + 16, state.sequenceCounter, 3);
+        contexts.push_back(ctx2);
+        contextNames.push_back("With Sequence (host||card||seq)");
+
+        // Context 3: Sequence first (seq || host || card)
+        std::vector<unsigned char> ctx3(19);
+        memcpy(ctx3.data(), state.sequenceCounter, 3);
+        memcpy(ctx3.data() + 3, state.hostChallenge, 8);
+        memcpy(ctx3.data() + 11, state.cardChallenge, 8);
+        contexts.push_back(ctx3);
+        contextNames.push_back("Sequence First (seq||host||card)");
+
+        for (size_t ctxIdx = 0; ctxIdx < contexts.size(); ctxIdx++) {
+            std::cout << "\n  Testing context: " << contextNames[ctxIdx] << std::endl;
+
+            // Derive session keys
+            unsigned char senc[16], smac[16], srmac[16];
+
+            if (!deriveSessionKey_SCP03(masterKey, 0x01, contexts[ctxIdx].data(), contexts[ctxIdx].size(), senc)) {
+                continue;
+            }
+            if (!deriveSessionKey_SCP03(masterKey, 0x02, contexts[ctxIdx].data(), contexts[ctxIdx].size(), smac)) {
+                continue;
+            }
+            if (!deriveSessionKey_SCP03(masterKey, 0x03, contexts[ctxIdx].data(), contexts[ctxIdx].size(), srmac)) {
+                continue;
+            }
+
+            // Now try different cryptogram calculation methods
+            unsigned char testCryptogram[8];
+
+            // Method 1: Standard context for cryptogram
+            if (calculateCryptogramDiagnostic(smac, state.hostChallenge, state.cardChallenge,
+                NULL, 0, testCryptogram, false)) {
+                std::cout << "    Method 1 (standard): ";
+                for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+
+                if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                    std::cout << " <- MATCH!" << std::endl;
+                    foundMatch = true;
+                    memcpy(workingKey, masterKey, 16);
+                    memcpy(state.senc, senc, 16);
+                    memcpy(state.smac, smac, 16);
+                    memcpy(state.srmac, srmac, 16);
+                    break;
+                }
+                else {
+                    std::cout << std::endl;
+                }
+            }
+
+            // Method 2: With sequence counter in cryptogram context
+            if (calculateCryptogramDiagnostic(smac, state.hostChallenge, state.cardChallenge,
+                state.sequenceCounter, 3, testCryptogram, false)) {
+                std::cout << "    Method 2 (with seq): ";
+                for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+
+                if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                    std::cout << " <- MATCH!" << std::endl;
+                    foundMatch = true;
+                    memcpy(workingKey, masterKey, 16);
+                    memcpy(state.senc, senc, 16);
+                    memcpy(state.smac, smac, 16);
+                    memcpy(state.srmac, srmac, 16);
+                    break;
+                }
+                else {
+                    std::cout << std::endl;
+                }
+            }
+
+            // Method 3: Using the master key directly for cryptogram
+            if (calculateCryptogramDiagnostic(masterKey, state.hostChallenge, state.cardChallenge,
+                NULL, 0, testCryptogram, false)) {
+                std::cout << "    Method 3 (master key): ";
+                for (int i = 0; i < 8; i++) printf("%02X ", testCryptogram[i]);
+
+                if (memcmp(testCryptogram, state.cardCryptogram, 8) == 0) {
+                    std::cout << " <- MATCH!" << std::endl;
+                    foundMatch = true;
+                    memcpy(workingKey, masterKey, 16);
+                    // Still use derived session keys
+                    memcpy(state.senc, senc, 16);
+                    memcpy(state.smac, smac, 16);
+                    memcpy(state.srmac, srmac, 16);
+                    break;
+                }
+                else {
+                    std::cout << std::endl;
+                }
+            }
+        }
+
+        if (foundMatch) break;
+    }
+
+    if (foundMatch) {
+        std::cout << "\n=== SUCCESS! Found working configuration ===" << std::endl;
+        std::cout << "Working Master Key: ";
+        for (int i = 0; i < 16; i++) printf("%02X ", workingKey[i]);
+        std::cout << std::endl;
+
+        std::cout << "Session Keys:" << std::endl;
+        std::cout << "S-ENC: ";
+        for (int i = 0; i < 16; i++) printf("%02X ", state.senc[i]);
+        std::cout << std::endl;
+        std::cout << "S-MAC: ";
+        for (int i = 0; i < 16; i++) printf("%02X ", state.smac[i]);
+        std::cout << std::endl;
+        std::cout << "S-RMAC: ";
+        for (int i = 0; i < 16; i++) printf("%02X ", state.srmac[i]);
+        std::cout << std::endl;
+
+        memset(state.macChaining, 0, 16);
+        memset(state.encCounter, 0, 16);
+        return 0;
+    }
+    else {
+        std::cout << "\n=== FAILED: No matching configuration found ===" << std::endl;
+        std::cout << "The card may be using:" << std::endl;
+        std::cout << "- A different master key" << std::endl;
+        std::cout << "- Key diversification based on card serial" << std::endl;
+        std::cout << "- A proprietary SCP03 variant" << std::endl;
         return -1;
     }
-    std::cout << "S-ENC: ";
-    for (int i = 0; i < 16; i++) printf("%02X ", state.senc[i]);
-    std::cout << std::endl;
-
-    if (!deriveSessionKey_SCP03(masterKey, 0x02, context, 16, state.smac)) {
-        std::cerr << "Failed to derive S-MAC" << std::endl;
-        return -1;
-    }
-    std::cout << "S-MAC: ";
-    for (int i = 0; i < 16; i++) printf("%02X ", state.smac[i]);
-    std::cout << std::endl;
-
-    if (!deriveSessionKey_SCP03(masterKey, 0x03, context, 16, state.srmac)) {
-        std::cerr << "Failed to derive S-RMAC" << std::endl;
-        return -1;
-    }
-    std::cout << "S-RMAC: ";
-    for (int i = 0; i < 16; i++) printf("%02X ", state.srmac[i]);
-    std::cout << std::endl;
-
-    memset(state.macChaining, 0, 16);
-    memset(state.encCounter, 0, 16);
-
-    std::cout << "? Session keys derived successfully" << std::endl;
-    return 0;
 }
 
-bool SmartCardCryptoSCP03::calculateSCP03Cryptogram(const unsigned char* key,
+// Diagnostic cryptogram calculation that can try different contexts
+bool SmartCardCryptoSCP03::calculateCryptogramDiagnostic(const unsigned char* key,
     const unsigned char* hostChallenge,
     const unsigned char* cardChallenge,
-    unsigned char* cryptogram) {
-    unsigned char data[16];
-    memcpy(data, hostChallenge, 8);
-    memcpy(data + 8, cardChallenge, 8);
+    const unsigned char* extraData,
+    size_t extraLen,
+    unsigned char* cryptogram,
+    bool isHostCryptogram) {
+    std::vector<unsigned char> derivationData;
+
+    // Label with derivation constant
+    unsigned char label[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    label[10] = isHostCryptogram ? 0x01 : 0x00;
+
+    derivationData.insert(derivationData.end(), label, label + 11);
+    derivationData.push_back(0x00);  // Separator
+    derivationData.push_back(0x00);  // L MSB
+    derivationData.push_back(0x40);  // L LSB
+    derivationData.push_back(0x01);  // Counter i
+
+    // Context
+    derivationData.insert(derivationData.end(), hostChallenge, hostChallenge + 8);
+    derivationData.insert(derivationData.end(), cardChallenge, cardChallenge + 8);
+
+    // Optional extra data (like sequence counter)
+    if (extraData && extraLen > 0) {
+        derivationData.insert(derivationData.end(), extraData, extraData + extraLen);
+    }
 
     unsigned char fullMac[16];
-    if (!performAES_CMAC(key, data, 16, fullMac)) {
+    if (!performAES_CMAC(key, derivationData.data(), derivationData.size(), fullMac)) {
         return false;
     }
 
@@ -262,18 +571,60 @@ bool SmartCardCryptoSCP03::calculateSCP03Cryptogram(const unsigned char* key,
     return true;
 }
 
+bool SmartCardCryptoSCP03::calculateSCP03Cryptogram(const unsigned char* key,
+    const unsigned char* hostChallenge,
+    const unsigned char* cardChallenge,
+    unsigned char* cryptogram,
+    bool isHostCryptogram) {
+    std::vector<unsigned char> derivationData;
+
+    // Label: 11 bytes with derivation constant
+    // Per GP spec Table 4-1: 0x00 for card, 0x01 for host
+    unsigned char label[11] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    label[10] = isHostCryptogram ? 0x01 : 0x00;
+
+    derivationData.insert(derivationData.end(), label, label + 11);
+    derivationData.push_back(0x00);  // Separator
+    derivationData.push_back(0x00);  // L MSB
+    derivationData.push_back(0x40);  // L LSB (64 bits = 8 bytes cryptogram)
+    derivationData.push_back(0x01);  // Counter i
+
+    // Context per GP spec 6.2.2.2 and 6.2.2.3:
+    // "The context parameter shall be set to the concatenation of 
+    //  the host challenge and the card challenge"
+    // NO sequence counter in the context!
+    derivationData.insert(derivationData.end(), hostChallenge, hostChallenge + 8);
+    derivationData.insert(derivationData.end(), cardChallenge, cardChallenge + 8);
+
+    std::cout << "Cryptogram Derivation Input ("
+        << (isHostCryptogram ? "HOST" : "CARD") << "): ";
+    for (auto b : derivationData) printf("%02X ", b);
+    std::cout << std::endl;
+
+    unsigned char fullMac[16];
+    if (!performAES_CMAC(key, derivationData.data(), derivationData.size(), fullMac)) {
+        return false;
+    }
+
+    // Take first 8 bytes as cryptogram
+    memcpy(cryptogram, fullMac, 8);
+    return true;
+}
+
 std::vector<unsigned char> SmartCardCryptoSCP03::createExternalAuthenticateCommand(uint8_t securityLevel) {
     std::vector<unsigned char> apdu;
 
-    if (!state.channelActive && state.senc[0] == 0 && state.smac[0] == 0) {
+    if (!state.smac[0] && !state.smac[1]) {
         std::cerr << "ERROR: Session keys not initialized" << std::endl;
         return apdu;
     }
 
     std::cout << "\n=== SCP03 EXTERNAL AUTHENTICATE ===" << std::endl;
 
+    // Calculate host cryptogram using the FIXED method
     unsigned char hostCryptogram[8];
-    if (!calculateSCP03Cryptogram(state.smac, state.hostChallenge, state.cardChallenge, hostCryptogram)) {
+    if (!calculateSCP03Cryptogram(state.smac, state.hostChallenge,
+        state.cardChallenge, hostCryptogram, true)) {
         std::cerr << "Failed to calculate host cryptogram" << std::endl;
         return apdu;
     }
@@ -282,13 +633,30 @@ std::vector<unsigned char> SmartCardCryptoSCP03::createExternalAuthenticateComma
     for (int i = 0; i < 8; i++) printf("%02X ", hostCryptogram[i]);
     std::cout << std::endl;
 
+    // Build EXTERNAL AUTHENTICATE command
     apdu = { 0x84, 0x82, securityLevel, 0x00, 0x10 };
     apdu.insert(apdu.end(), hostCryptogram, hostCryptogram + 8);
+
+    // Reserve space for MAC
     apdu.insert(apdu.end(), 8, 0x00);
 
+    // Calculate C-MAC
     std::vector<unsigned char> macInput;
+
+    // MAC chaining value (initially all zeros)
     macInput.insert(macInput.end(), state.macChaining, state.macChaining + 16);
+
+    // Command header + data (excluding MAC)
     macInput.insert(macInput.end(), apdu.begin(), apdu.begin() + 13);
+
+    std::cout << "\n=== MAC CALCULATION ===" << std::endl;
+    std::cout << "MAC Chaining Value: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", state.macChaining[i]);
+    std::cout << std::endl;
+
+    std::cout << "MAC Input Data: ";
+    for (auto b : macInput) printf("%02X ", b);
+    std::cout << std::endl;
 
     unsigned char mac[16];
     if (!performAES_CMAC(state.smac, macInput.data(), macInput.size(), mac)) {
@@ -296,12 +664,19 @@ std::vector<unsigned char> SmartCardCryptoSCP03::createExternalAuthenticateComma
         return {};
     }
 
-    memcpy(state.macChaining, mac, 16);
-    memcpy(&apdu[13], mac, 8);
+    std::cout << "Full MAC Output: ";
+    for (int i = 0; i < 16; i++) printf("%02X ", mac[i]);
+    std::cout << std::endl;
 
-    std::cout << "Command MAC: ";
+    std::cout << "Using First 8 Bytes: ";
     for (int i = 0; i < 8; i++) printf("%02X ", mac[i]);
     std::cout << std::endl;
+
+    // Update MAC chaining value for next command
+    memcpy(state.macChaining, mac, 16);
+
+    // Insert MAC into command (8 bytes)
+    memcpy(&apdu[13], mac, 8);
 
     std::cout << "Final Command: ";
     for (auto b : apdu) printf("%02X ", b);
