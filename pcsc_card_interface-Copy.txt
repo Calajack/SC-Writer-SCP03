@@ -19,7 +19,7 @@
 
 PCScCardInterface::PCScCardInterface() : hContext(0), hCard(0), dwActiveProtocol(0), cardConnected(false) {}
 
-PCScCardInterface::~PCScCardInterface() { 
+PCScCardInterface::~PCScCardInterface() {
     disconnect();
     if (hContext) {
         SCardReleaseContext(hContext);
@@ -311,6 +311,36 @@ std::vector<unsigned char> PCScCardInterface::sendAPDU(const std::vector<unsigne
         printf("%02X ", byte);
     }
     std::cout << std::endl;
+
+    // Auto-handle 61xx (GET RESPONSE)
+    if (result.size() >= 2 && result[result.size() - 2] == 0x61) {
+        unsigned char le = result.back();
+        std::vector<unsigned char> getResp = { 0x00, 0xC0, 0x00, 0x00, le };
+        std::cout << "=> Auto GET RESPONSE (61xx)" << std::endl;
+        return sendAPDU(getResp);  // Recursive call
+    }
+
+    // Auto-handle 6Cxx (correct Le)
+    if (result.size() >= 2 && result[result.size() - 2] == 0x6C) {
+        unsigned char correctLe = result.back();
+        std::vector<unsigned char> corrected = apdu;
+        if (corrected.size() > 4) {
+            corrected.back() = correctLe;
+        }
+        else {
+            corrected.push_back(correctLe);
+        }
+        std::cout << "=> Auto-retry with Le=" << (int)correctLe << " (6Cxx)" << std::endl;
+        return sendAPDU(corrected);  // Recursive call
+    }
+
+    // Log incoming response (keep your existing logging)
+    std::cout << "<< ";
+    for (auto byte : result) {
+        printf("%02X ", byte);
+    }
+    std::cout << std::endl;
+
 
     return result;
 }
