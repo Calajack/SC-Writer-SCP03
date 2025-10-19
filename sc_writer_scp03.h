@@ -18,6 +18,7 @@ private:
     bool installDATFile(const std::string& filename);
     bool executePersonalizationScript(const std::string& scriptFile);
     bool verifyCompleteInstallation();
+    
 
     bool sendExtendedAPDU(const std::vector<unsigned char>& apdu,
         std::vector<unsigned char>& response);
@@ -31,7 +32,11 @@ private:
         const std::string& operation);
     bool isDestructiveCommand(const std::vector<unsigned char>& apdu);
 
+    bool establishSCP03(uint8_t securityLevel = 0x03, bool skipISDSelection = false);
+
     bool isCardAlreadyInitialized();
+    void testGemaltoDiversification(const unsigned char* cplcData);
+    bool testWithDiversification();
     void logCardState(const std::string& operation);
 
     bool prePersonalizeForSCP03();
@@ -53,5 +58,7 @@ public:
     bool testSCP03Handshake();
     bool testExtendedAPDU();
     bool testCompleteWorkflow();
+    bool getCardInformation();
+    void testEMVDiversification(const unsigned char* serial, size_t serialLen);
 };
 
