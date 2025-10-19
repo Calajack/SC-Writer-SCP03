@@ -42,6 +42,9 @@ private:
         const unsigned char* context, size_t contextLen,
         unsigned char* derivedKey);
 
+    std::vector<unsigned char> cardDiversificationData;
+    std::vector<unsigned char> initUpdateResponse;
+
     bool calculateSCP03Cryptogram(const unsigned char* key,
         const unsigned char* hostChallenge,
         const unsigned char* cardChallenge,
@@ -87,4 +90,7 @@ public:
     void printSessionKeys() const;
     void printMacChainingValue() const;
     void resetChannel();
+    void setDiversificationData(const std::vector<unsigned char>& data);
+    void setInitUpdateResponse(const std::vector<unsigned char>& response);
+    
 };
